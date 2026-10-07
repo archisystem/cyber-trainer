@@ -6,6 +6,7 @@ import curses
 import locale
 import os
 import random
+import re
 import subprocess
 import textwrap
 from pathlib import Path
@@ -25,7 +26,8 @@ DEFAULT_PROGRESS = {
     "tests": 0,
     "correct": 0,
     "lessons": [],
-    "incidents": 0
+    "incidents": 0,
+    "topics": {}
 }
 
 QUESTIONS = [
@@ -428,18 +430,18 @@ INCIDENTS = [
 
 
 def load_progress():
+    result = {**DEFAULT_PROGRESS, "lessons": [], "topics": {}}
     if DATA_FILE.exists():
         try:
             data = json.loads(DATA_FILE.read_text(encoding="utf-8"))
             if isinstance(data, dict):
-                merged = {**DEFAULT_PROGRESS, **data}
-                if not isinstance(merged.get("lessons"), list):
-                    merged["lessons"] = []
-                return merged
+                result.update(data)
         except Exception:
             pass
-    result = DEFAULT_PROGRESS.copy()
-    result["lessons"] = []
+    if not isinstance(result.get("lessons"), list):
+        result["lessons"] = []
+    if not isinstance(result.get("topics"), dict):
+        result["topics"] = {}
     return result
 
 
@@ -2530,40 +2532,358 @@ def lesson_menu(stdscr):
         show_text(stdscr, title, lines, note)
 
 
-def quiz(stdscr):
-    questions = QUESTIONS[:]
-    random.shuffle(questions)
-    questions = questions[:5]
-    total_q = len(questions)
+# ============================================================
+# 🧠 ТЕСТ ПО ВСЕМ ТЕМАМ
+# Вопросы собираются автоматически из материалов тренажёра:
+# уроки, команды Linux/Cisco, схемы диагностики, порты, атаки,
+# subnetting, инциденты SOC и база знаний.
+# ============================================================
 
-    for i, item in enumerate(questions, 1):
-        options = item["options"]
-        visible = list(range(len(options)))   # индексы вариантов, которые ещё показаны
-        hint_used = False
-        selected = 0
-        while True:
-            stdscr.erase()
-            h, w = stdscr.getmaxyx()
-            safe_addstr(stdscr, 1, 2, "🧠 ТЕСТ", curses.A_BOLD)
-            safe_addstr(stdscr, 2, 2, "═" * min(58, max(10, w - 4)))
-            safe_addstr(stdscr, 4, 2, f"Вопрос {i}/{total_q}")
+TEST_TOPICS = [
+    ("🎲 Все темы (смешанный тест)", None),
+    ("🐧 Linux", "linux"),
+    ("🌐 Сети Linux", "linux_net"),
+    ("🛰 Cisco: команды", "cisco"),
+    ("🗺 Диагностика по схемам", "diag"),
+    ("🧮 Subnetting", "subnet"),
+    ("🔌 Порты", "ports"),
+    ("🔍 Nmap", "nmap"),
+    ("📜 Логи", "logs"),
+    ("⚙️ Процессы и службы", "proc"),
+    ("⚔️ Типы атак", "attacks"),
+    ("🛡️ SOC и расследования", "soc"),
+]
+TEST_LABELS = {key: label for label, key in TEST_TOPICS if key}
 
-            y = 6
-            for part in wrap_line(item["q"], max(20, w - 6)):
-                safe_addstr(stdscr, y, 3, part, curses.A_BOLD)
-                y += 1
+LESSON_TOPIC = {"1": "linux", "2": "linux_net", "3": "nmap", "4": "logs", "5": "proc", "6": "soc"}
+
+
+def _strip_dot(text):
+    return str(text).strip().rstrip(".")
+
+
+def _strip_emoji(text):
+    return re.sub(r"^[^\w]+", "", str(text)).strip()
+
+
+def _mc(topic, key, q, correct, near, far=(), explain=""):
+    """Собирает вопрос с вариантами. near — «похожие» неверные ответы (берутся первыми)."""
+    correct = str(correct)
+    seen = {norm(correct)}
+    wrong = []
+    for group in (list(near), list(far)):
+        random.shuffle(group)
+        for item in group:
+            ni = norm(str(item))
+            if ni and ni not in seen:
+                seen.add(ni)
+                wrong.append(str(item))
+            if len(wrong) >= 3:
+                break
+        if len(wrong) >= 3:
+            break
+    if not wrong:
+        return None
+    options = [correct] + wrong
+    random.shuffle(options)
+    return {
+        "topic": topic, "key": key, "q": q, "options": options,
+        "answer": options.index(correct), "explain": explain,
+    }
+
+
+def _cmd_family(cmd):
+    c = norm(cmd)
+    if c.startswith("show ip ospf") or c == "show ip protocols":
+        return "ospf"
+    if c in ("show vlan brief", "show interfaces trunk", "show etherchannel summary"):
+        return "l2"
+    if c == "show standby":
+        return "hsrp"
+    if c.startswith("show ip"):
+        return "l3"
+    if c in ("ping", "traceroute"):
+        return "conn"
+    if c.startswith("show "):
+        return "cisco_other"
+    if c.startswith("ip ") or c.startswith("ss "):
+        return "linux"
+    return "other"
+
+
+def _is_cisco(cmd):
+    return norm(cmd).startswith("show ") or norm(cmd) in ("ping", "traceroute")
+
+
+def _lesson_questions(key):
+    topic = LESSON_TOPIC[key]
+    items = LESSONS[key][1]
+    all_items = [it for k in LESSONS for it in LESSONS[k][1] if not it[0].startswith("Сначала")]
+    real_items = [it for it in items if not it[0].startswith("Сначала")]
+    out = []
+
+    for cmd, desc in real_items:
+        expl = f"{cmd} — {desc}"
+        if key == "6":
+            qa = f"Зачем в SOC-расследовании используют «{cmd}»?"
+            qb = f"Какая команда помогает в расследовании: «{_strip_dot(desc)}»?"
+        else:
+            qa = f"Что делает команда «{cmd}»?"
+            qb = f"Какая команда подходит под описание: «{_strip_dot(desc)}»?"
+
+        near_d = [d for c, d in real_items if norm(c) != norm(cmd)]
+        far_d = [d for c, d in all_items if norm(c) != norm(cmd)]
+        out.append(_mc(topic, f"A:{norm(cmd)}", qa, desc, near_d, far_d, expl))
+
+        # обратный вопрос — только если описание однозначно
+        same_desc = [c for c, d in all_items if norm(d) == norm(desc) and norm(c) != norm(cmd)]
+        if not same_desc:
+            near_c = [c for c, d in real_items if norm(c) != norm(cmd)]
+            far_c = [c for c, d in all_items if norm(c) != norm(cmd)]
+            out.append(_mc(topic, f"B:{norm(cmd)}", qb, cmd, near_c, far_c, expl))
+
+    if key == "6":
+        out.append(_mc(
+            "soc", "soc:first-rule", "Что нужно делать в самом начале расследования инцидента?",
+            "Сначала собрать факты и не делать поспешных выводов",
+            ["Сразу перезагрузить сервер", "Удалить подозрительные файлы",
+             "Заблокировать всех пользователей", "Очистить историю команд"],
+            explain="Сначала факты и артефакты, потом выводы и containment."))
+    return [q for q in out if q]
+
+
+def _commands_questions():
+    out = []
+    all_answers = [a for _, _, a in COMMANDS]
+    cisco = [a for a in all_answers if _is_cisco(a)]
+    linux = [a for a in all_answers if _cmd_family(a) == "linux"]
+    lesson2 = [c for c, _ in LESSONS["2"][1]]
+
+    for cat, question, answer in COMMANDS:
+        expl = f"{answer} — {question}"
+        if answer.startswith("/"):
+            near = [f"/{n}" for n in (16, 24, 25, 26, 27, 28, 29, 30)]
+            out.append(_mc("subnet", f"cmd:{norm(answer)}", question, answer, near, (), expl))
+        elif answer.isdigit():
+            n = int(answer)
+            near = [str(x) for x in (n + 2, n - 2, n * 2 + 2, n // 2, n + 1, n - 1, n * 2) if x > 0]
+            out.append(_mc("subnet", f"cmd:{norm(answer)}", question, answer, near, (), expl))
+        elif _is_cisco(answer):
+            near = [a for a in cisco if a != answer]
+            far = linux
+            out.append(_mc("cisco", f"cmd:{norm(answer)}", question, answer, near, far, expl))
+        else:
+            # ss -tuln и ss -tulpn — почти одинаковы, не ставим их рядом
+            bad = lambda a: a.startswith("ss ") and answer.startswith("ss ")
+            near = [a for a in linux + lesson2 if a != answer and not bad(a)]
+            far = [a for a in cisco if not bad(a)]
+            out.append(_mc("linux_net", f"cmd:{norm(answer)}", question, answer, near, far, expl))
+    return [q for q in out if q]
+
+
+def _scenario_questions():
+    out = []
+    cisco_all = sorted({a for s in SCENARIOS for _, a, _ in s["steps"] if _is_cisco(a)})
+    linux_all = sorted({a for s in SCENARIOS for _, a, _ in s["steps"] if not _is_cisco(a)})
+    linux_extra = ["ss -tulpn", "ps aux", "ls -la", "whoami", "pwd"]
+    for s in SCENARIOS:
+        for n, (question, answer, explain) in enumerate(s["steps"], 1):
+            fam = _cmd_family(answer)
+            if _is_cisco(answer):
+                near = [a for a in cisco_all if _cmd_family(a) != fam]
+                far = linux_all
+            else:
+                near = [a for a in cisco_all]
+                far = [a for a in linux_all + linux_extra if _cmd_family(a) != fam]
+            text = f"Схема: {s['name']}\nСитуация: {s['problem']}\n\n{question}"
+            out.append(_mc("diag", f"diag:{s['name']}:{n}", text, answer, near, far,
+                           f"{answer} — {explain}"))
+    return [q for q in out if q]
+
+
+def _ports_questions():
+    out = []
+    services = [svc for _, svc, _ in PORTS]
+    for port, svc, purpose in PORTS:
+        expl = f"{port}/TCP — {svc}: {purpose}"
+        out.append(_mc("ports", f"p2s:{port}", f"Какой сервис обычно связан с портом {port}?",
+                       svc, [s for s in services if s != svc], (), expl))
+        if sum(1 for _, s, _ in PORTS if s == svc) == 1:      # DHCP (67/68) неоднозначен
+            other_ports = [f"{p}/TCP" for p, s, _ in PORTS if s != svc]
+            out.append(_mc("ports", f"s2p:{port}", f"Какой порт обычно использует сервис {svc}?",
+                           f"{port}/TCP", other_ports, (), expl))
+        out.append(_mc("ports", f"purpose:{port}", f"Для чего используется порт {port} ({svc})?",
+                       purpose, [p for _, s, p in PORTS if s != svc], (), expl))
+    return [q for q in out if q]
+
+
+def _attack_questions():
+    out = []
+    names = [a["name"] for a in ATTACKS]
+    for a in ATTACKS:
+        wrong = [n for n in names if n != a["name"]]
+        expl = f"{a['name']}: {a['description']} Защита: {a['defense']}"
+        for field, label in (("process", "Что происходит"), ("signs", "Признаки"), ("description", "Описание")):
+            text = a[field]
+            if a["name"].lower() in text.lower():
+                continue
+            out.append(_mc("attacks", f"atk:{a['name']}:{field}",
+                           f"{label}: {text}\n\nКакой это тип атаки?", a["name"], wrong, (), expl))
+    return [q for q in out if q]
+
+
+def _subnet_questions():
+    out = []
+    for i, item in enumerate(SUBNETTING_QUESTIONS):
+        correct = item["choices"][item["answer"]]
+        wrong = [c for j, c in enumerate(item["choices"]) if j != item["answer"]]
+        out.append(_mc("subnet", f"sub:{i}", item["q"], correct, wrong, (), item["explain"]))
+    return [q for q in out if q]
+
+
+def _original_questions():
+    out = []
+    for i, item in enumerate(QUESTIONS):
+        opts = [re.sub(r"^[A-D]\)\s*", "", o) for o in item["options"]]
+        idx = ord(item["answer"]) - ord("A")
+        text = (item["q"] + " " + " ".join(opts)).lower()
+        if "nmap" in text:
+            topic = "nmap"
+        elif "journalctl" in text:
+            topic = "logs"
+        elif "ss -tulpn" in text or "ip addr" in text:
+            topic = "linux_net"
+        elif "pid" in text or "процесс" in text:
+            topic = "proc"
+        else:
+            topic = "linux"
+        wrong = [o for j, o in enumerate(opts) if j != idx]
+        out.append(_mc(topic, f"orig:{i}", item["q"], opts[idx], wrong, (), item["explain"]))
+    return [q for q in out if q]
+
+
+def _soc_questions():
+    out = []
+    # 1) термины
+    defs = [(_strip_emoji(t), d) for t, d in GENERAL_KNOWLEDGE]
+    for term, definition in defs:
+        out.append(_mc("soc", f"gk:{term}", f"Что означает термин «{term}» в SOC?", definition,
+                       [d for t, d in defs if t != term], (), f"{term}: {definition}"))
+    # 2) что делает команда/действие из базы знаний
+    keys = list(COMMAND_KNOWLEDGE)
+    for k, info in COMMAND_KNOWLEDGE.items():
+        out.append(_mc("soc", f"ck:{k}", f"Какое действие или команда: «{info['what']}»?", k,
+                       [x for x in keys if x != k], (), f"{k} — {info['what']} {info['why']}"))
+    # 3) выбор лучшего шага в инцидентах
+    for inc in INCIDENTS:
+        title = _strip_emoji(inc["title"])
+        for n, step in enumerate(inc["steps"], 1):
+            best = max(p for _, _, p in step["options"])
+            top = [o for o in step["options"] if o[2] == best]
+            if len(top) != 1:
+                continue
+            cmd, desc, _ = top[0]
+            wrong = [f"{c} — {d}" for c, d, p in step["options"] if p != best]
+            text = (f"Инцидент: {title}\n{inc['story']}\n\n{step.get('question', 'Что делаешь дальше?')}\n"
+                    f"(выбери оптимальное действие)")
+            out.append(_mc("soc", f"inc:{title}:{n}", text, f"{cmd} — {desc}", wrong, (), step["hint"]))
+    return [q for q in out if q]
+
+
+def build_test_bank():
+    """Банк вопросов: {ключ_темы: [вопросы]}."""
+    bank = {key: [] for _, key in TEST_TOPICS if key}
+    builders = [
+        lambda: [q for k in LESSONS for q in _lesson_questions(k)],
+        _commands_questions, _scenario_questions, _ports_questions,
+        _attack_questions, _subnet_questions, _original_questions, _soc_questions,
+    ]
+    for build in builders:
+        for q in build():
+            bank[q["topic"]].append(q)
+    return bank
+
+
+def pick_test_questions(bank, topic_key, count):
+    seen = set()
+    if topic_key:
+        pool = bank[topic_key][:]
+        random.shuffle(pool)
+        picked = []
+        for q in pool:
+            if q["key"] not in seen:
+                seen.add(q["key"])
+                picked.append(q)
+        return picked[:count]
+
+    # смешанный режим: по кругу из каждой темы, чтобы были все ветки
+    pools = {k: random.sample(v, len(v)) for k, v in bank.items() if v}
+    picked = []
+    while len(picked) < count and any(pools.values()):
+        for k in list(pools):
+            while pools[k]:
+                q = pools[k].pop()
+                if q["key"] not in seen:
+                    seen.add(q["key"])
+                    picked.append(q)
+                    break
+            if len(picked) >= count:
+                break
+    random.shuffle(picked)
+    return picked
+
+
+def _draw_test_question(stdscr, label, number, total, score, item, visible, selected, hint_available):
+    stdscr.erase()
+    h, w = stdscr.getmaxyx()
+    width = max(20, w - 8)
+    safe_addstr(stdscr, 0, 2, f"🧠 ТЕСТ • {label}"[:w - 4], curses.A_BOLD)
+    safe_addstr(stdscr, 1, 2, "═" * min(58, max(10, w - 4)))
+    safe_addstr(stdscr, 2, 2, f"Вопрос {number}/{total}    ✅ Верно: {score}    [{TEST_LABELS.get(item['topic'], '')}]")
+
+    option_blocks = []
+    for pos, idx in enumerate(visible):
+        text = f"{chr(65 + idx)}) {item['options'][idx]}"
+        option_blocks.append(textwrap.wrap(text, width=width, subsequent_indent="    ") or [text])
+
+    need_options = sum(len(b) for b in option_blocks)
+    q_lines = []
+    for line in item["q"].split("\n"):
+        q_lines.extend(wrap_line(line, width))
+    room = max(1, (h - 6) - need_options - 1)
+    if len(q_lines) > room:
+        q_lines = q_lines[:room - 1] + ["…"]
+
+    y = 4
+    for line in q_lines:
+        safe_addstr(stdscr, y, 3, line, curses.A_BOLD)
+        y += 1
+    y += 1
+    for pos, block in enumerate(option_blocks):
+        attr = curses.A_REVERSE | curses.A_BOLD if pos == selected else curses.A_NORMAL
+        for k, line in enumerate(block):
+            safe_addstr(stdscr, y, 3, ("➤ " if (pos == selected and k == 0) else "  ") + line, attr)
             y += 1
 
-            for pos, idx in enumerate(visible):
-                attr = curses.A_REVERSE | curses.A_BOLD if pos == selected else curses.A_NORMAL
-                prefix = "➤ " if pos == selected else "  "
-                safe_addstr(stdscr, y + pos, 3, prefix + options[idx], attr)
+    if hint_available:
+        safe_addstr(stdscr, h - 3, 2, " ? / Tab / F1  →  💡 ПОДСКАЗКА (убрать 2 неверных) ", curses.A_REVERSE | curses.A_BOLD)
+    safe_addstr(stdscr, h - 2, 2, "↑/↓ или A–D выбор • Enter ответить • Esc завершить тест")
+    stdscr.refresh()
 
-            if not hint_used:
-                safe_addstr(stdscr, h - 3, 2, " ? / Tab / F1  →  💡 ПОДСКАЗКА (убрать 2 неверных) ", curses.A_REVERSE | curses.A_BOLD)
-            safe_addstr(stdscr, h - 2, 2, "↑/↓ выбор • Enter ответ • Esc выйти")
-            stdscr.refresh()
 
+def run_test(stdscr, label, questions):
+    """Проводит тест. Возвращает список результатов по каждому отвеченному вопросу."""
+    results = []
+    score = 0
+    total = len(questions)
+
+    for number, item in enumerate(questions, 1):
+        visible = list(range(len(item["options"])))
+        hint_used = False
+        selected = 0
+
+        while True:
+            _draw_test_question(stdscr, label, number, total, score, item, visible, selected, not hint_used and len(visible) > 2)
             key = stdscr.getch()
             if key in (curses.KEY_UP, ord("k")):
                 selected = (selected - 1) % len(visible)
@@ -2572,30 +2892,134 @@ def quiz(stdscr):
             elif key in (curses.KEY_ENTER, 10, 13):
                 break
             elif key == 27:
-                return
-            elif key in KEYS_HINT and not hint_used:
+                return results
+            elif key in KEYS_HINT and not hint_used and len(visible) > 2:
                 hint_used = True
-                correct_idx = ord(item["answer"]) - ord("A")
-                wrong = [idx for idx in visible if idx != correct_idx]
-                for idx in random.sample(wrong, min(2, len(wrong))):
-                    visible.remove(idx)
+                wrong = [i for i in visible if i != item["answer"]]
+                for i in random.sample(wrong, min(2, len(wrong))):
+                    visible.remove(i)
                 selected = 0
+            elif ord("a") <= key <= ord("d") or ord("A") <= key <= ord("D"):
+                idx = (key - ord("a")) if key >= ord("a") else (key - ord("A"))
+                if idx in visible:
+                    selected = visible.index(idx)
+            elif ord("1") <= key <= ord("9") and key - ord("1") < len(visible):
+                selected = key - ord("1")
 
-        progress["tests"] += 1
-        chosen_letter = chr(ord("A") + visible[selected])
-        if chosen_letter == item["answer"]:
-            progress["correct"] += 1
-            gained = 10 if hint_used else 20
+        chosen = visible[selected]
+        correct = chosen == item["answer"]
+        if correct:
+            score += 1
+            gained = 5 if hint_used else 10
             add_xp(gained)
-            result = [f"✅ Правильно! +{gained} XP" + (" (с подсказкой)" if hint_used else ""),
-                      f"💡 {item['explain']}"]
+            head = f"✅ Правильно! +{gained} XP" + (" (с подсказкой)" if hint_used else "")
         else:
-            result = [
-                f"❌ Неправильно. Правильный ответ: {item['answer']}",
-                f"💡 {item['explain']}"
-            ]
-        save_progress()
-        show_text(stdscr, f"Результат — вопрос {i}/{total_q}", result)
+            head = "❌ Неправильно"
+        results.append({"item": item, "correct": correct, "chosen": item["options"][chosen],
+                        "hint": hint_used, "xp": (5 if hint_used else 10) if correct else 0})
+
+        right = f"{chr(65 + item['answer'])}) {item['options'][item['answer']]}"
+        lines = [head, ""]
+        if not correct:
+            lines += [f"Твой ответ: {chr(65 + chosen)}) {item['options'][chosen]}", f"Правильный ответ: {right}", ""]
+        if item.get("explain"):
+            lines.append(f"💡 {item['explain']}")
+        show_text(stdscr, f"Результат — вопрос {number}/{total}", lines)
+
+    return results
+
+
+def show_test_summary(stdscr, label, results):
+    answered = len(results)
+    if not answered:
+        return
+    correct = sum(1 for r in results if r["correct"])
+    xp = sum(r["xp"] for r in results)
+    percent = round(correct / answered * 100)
+
+    progress["tests"] += answered
+    progress["correct"] += correct
+    topics = progress.setdefault("topics", {})
+    per_topic = {}
+    for r in results:
+        t = r["item"]["topic"]
+        per_topic.setdefault(t, [0, 0])
+        per_topic[t][1] += 1
+        per_topic[t][0] += 1 if r["correct"] else 0
+    for t, (c, n) in per_topic.items():
+        old = topics.get(t, [0, 0])
+        topics[t] = [old[0] + c, old[1] + n]
+    save_progress()
+
+    if percent >= 90:
+        grade = "🏆 Отлично"
+    elif percent >= 70:
+        grade = "🔥 Хорошо"
+    elif percent >= 50:
+        grade = "👍 Нормально, есть что подтянуть"
+    else:
+        grade = "📚 Стоит повторить материал"
+
+    lines = [
+        f"{grade}",
+        f"Тема: {label}",
+        f"Правильных ответов: {correct}/{answered}  ({percent}%)",
+        f"✨ Получено XP: +{xp}",
+        "",
+        "📊 ПО ТЕМАМ:",
+    ]
+    for t, (c, n) in per_topic.items():
+        lines.append(f"  {TEST_LABELS.get(t, t)}: {c}/{n}")
+
+    weak = [TEST_LABELS.get(t, t) for t, (c, n) in per_topic.items() if n >= 2 and c / n < 0.6]
+    if weak:
+        lines += ["", "🎯 Стоит повторить: " + ", ".join(weak)]
+
+    mistakes = [r for r in results if not r["correct"]]
+    if mistakes:
+        lines += ["", "❌ РАБОТА НАД ОШИБКАМИ:"]
+        for n, r in enumerate(mistakes, 1):
+            item = r["item"]
+            short = item["q"].strip().split("\n")[-1]
+            if short.startswith("("):
+                short = [ln for ln in item["q"].strip().split("\n") if ln.strip()][-2]
+            lines += [f"{n}. {short}", f"   ✔ {item['options'][item['answer']]}", ""]
+
+    show_text(stdscr, "🏁 ИТОГ ТЕСТА", lines)
+
+
+def quiz(stdscr):
+    """Тест по всем веткам тренажёра: выбор темы → количество вопросов → тест → разбор."""
+    bank = build_test_bank()
+    total_all = sum(len(v) for v in bank.values())
+
+    labels = []
+    for label, key in TEST_TOPICS:
+        count = total_all if key is None else len(bank[key])
+        labels.append(f"{label}  ({count})")
+    labels.append("↩️ Назад")
+
+    while True:
+        choice = arrow_menu(stdscr, "ТЕСТ • ВЫБЕРИ ТЕМУ", labels,
+                            "↑/↓ выбор • Enter • Esc назад",
+                            prompt="В скобках — сколько вопросов доступно в теме.")
+        if choice is None or choice == len(labels) - 1:
+            return
+        label, key = TEST_TOPICS[choice]
+        if key is not None and not bank[key]:
+            continue
+
+        lengths = [10, 20, 40]
+        ch = arrow_menu(stdscr, f"ТЕСТ • {label}", [f"{n} вопросов" for n in lengths] + ["↩️ Назад"],
+                        "↑/↓ выбор • Enter • Esc назад", prompt="Сколько вопросов?")
+        if ch is None or ch == len(lengths):
+            continue
+
+        questions = pick_test_questions(bank, key, lengths[ch])
+        if not questions:
+            continue
+        results = run_test(stdscr, label, questions)
+        show_test_summary(stdscr, label, results)
 
 
 def show_knowledge(stdscr, command, points):
@@ -3280,6 +3704,14 @@ def progress_menu(stdscr):
         ""
     ]
 
+    topics = progress.get("topics") or {}
+    if topics:
+        lines += ["📝 РЕЗУЛЬТАТЫ ТЕСТА ПО ТЕМАМ:"]
+        for t, (c, n) in topics.items():
+            if n:
+                lines.append(f"  {TEST_LABELS.get(t, t)}: {c}/{n} ({round(c / n * 100)}%)")
+        lines.append("")
+
     if level() >= 5:
         lines.append("🏆 Отличный прогресс! Можно переходить к более сложным сценариям.")
     elif level() >= 3:
@@ -3297,7 +3729,7 @@ def main_menu(stdscr):
     items = [
         "📚 Обучение",
         "🌐 Сети",
-        "🧠 Тест",
+        "🧠 Тест по всем темам",
         "🌐 Знание портов",
         "🧮 Тренажёр Subnetting",
         "🎯 Распознать атаку",
