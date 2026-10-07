@@ -3,11 +3,20 @@
 
 import json
 import curses
+import locale
 import os
 import random
 import subprocess
 import textwrap
 from pathlib import Path
+
+# Уменьшаем задержку после Esc (по умолчанию ncurses ждёт ~1 секунду)
+os.environ.setdefault("ESCDELAY", "25")
+# Нужно, чтобы curses корректно выводил юникод/эмодзи/кириллицу
+try:
+    locale.setlocale(locale.LC_ALL, "")
+except locale.Error:
+    pass
 
 DATA_FILE = Path.home() / ".cyber_trainer_progress.json"
 
@@ -422,20 +431,182 @@ def load_progress():
     if DATA_FILE.exists():
         try:
             data = json.loads(DATA_FILE.read_text(encoding="utf-8"))
-            return {**DEFAULT_PROGRESS, **data}
+            if isinstance(data, dict):
+                merged = {**DEFAULT_PROGRESS, **data}
+                if not isinstance(merged.get("lessons"), list):
+                    merged["lessons"] = []
+                return merged
         except Exception:
             pass
-    return DEFAULT_PROGRESS.copy()
+    result = DEFAULT_PROGRESS.copy()
+    result["lessons"] = []
+    return result
 
 
 progress = load_progress()
 
 
 def save_progress():
-    DATA_FILE.write_text(
-        json.dumps(progress, ensure_ascii=False, indent=2),
-        encoding="utf-8"
-    )
+    try:
+        DATA_FILE.write_text(
+            json.dumps(progress, ensure_ascii=False, indent=2),
+            encoding="utf-8"
+        )
+    except OSError:
+        # Не падаем, если домашняя папка недоступна для записи
+        pass
+
+
+
+# ============================================================
+# CURSES-ХЕЛПЕРЫ: безопасный вывод и нормализация клавиш
+# ============================================================
+
+def set_cursor(visible):
+    try:
+        curses.curs_set(1 if visible else 0)
+    except curses.error:
+        pass
+
+
+def safe_addstr(win, y, x, text, attr=0):
+    """addstr, который не падает на маленьком окне / у края экрана."""
+    try:
+        h, w = win.getmaxyx()
+        if y < 0 or y >= h or x < 0 or x >= w - 1:
+            return
+        win.addstr(y, x, str(text)[:max(0, w - x - 1)], attr)
+    except curses.error:
+        pass
+
+
+def wrap_line(line, width):
+    """Перенос строки с сохранением отступа (textwrap.wrap ломает ASCII-схемы)."""
+    line = str(line).replace("\t", "    ")
+    if not line.strip():
+        return [""]
+    indent = len(line) - len(line.lstrip(" "))
+    pad = " " * min(indent, max(0, width // 2))
+    return textwrap.wrap(
+        line.strip(),
+        width=max(10, width),
+        initial_indent=pad,
+        subsequent_indent=pad,
+        break_long_words=True,
+        replace_whitespace=False,
+    ) or [""]
+
+
+class KeyScreen:
+    """Обёртка над stdscr: getch() приводит любые стрелки/F1/PgUp к curses.KEY_*.
+
+    Многие терминалы шлют стрелки как ESC [ C вместо ESC O C. Тогда голый
+    getch() видит «27» (Esc) и программа выходит из урока вместо перехода
+    на следующую страницу. Здесь последовательность разбирается вручную.
+    """
+
+    def __init__(self, scr):
+        self._scr = scr
+
+    def __getattr__(self, name):
+        return getattr(self._scr, name)
+
+    def getch(self):
+        scr = self._scr
+        key = scr.getch()
+        if key != 27:
+            return key
+
+        seq = []
+        scr.timeout(40)
+        try:
+            first = scr.getch()
+            if first == -1:
+                return 27                      # настоящий Esc
+            if first not in (ord("["), ord("O")):
+                return 27                      # Alt+клавиша — считаем Esc
+            seq.append(first)
+            while len(seq) < 8:
+                k = scr.getch()
+                if k == -1:
+                    break
+                seq.append(k)
+                if k == ord("~") or (65 <= k <= 90) or (97 <= k <= 122):
+                    break
+        finally:
+            scr.timeout(-1)
+
+        text = "".join(chr(k) for k in seq[1:])
+        table = {
+            "A": curses.KEY_UP, "B": curses.KEY_DOWN,
+            "C": curses.KEY_RIGHT, "D": curses.KEY_LEFT,
+            "H": curses.KEY_HOME, "F": curses.KEY_END,
+            "P": curses.KEY_F1,
+            "1~": curses.KEY_HOME, "7~": curses.KEY_HOME,
+            "4~": curses.KEY_END, "8~": curses.KEY_END,
+            "5~": curses.KEY_PPAGE, "6~": curses.KEY_NPAGE,
+            "3~": curses.KEY_DC, "11~": curses.KEY_F1,
+        }
+        # модификаторы вида 1;5C (Ctrl+→) — берём последнюю букву
+        if ";" in text and text[-1].isalpha():
+            text = text[-1]
+        return table.get(text, -1)
+
+
+KEYS_PREV = (curses.KEY_LEFT, ord("h"), ord("H"), ord("p"), ord("P"),
+             curses.KEY_BACKSPACE, 127, 8, curses.KEY_PPAGE)
+KEYS_NEXT = (curses.KEY_RIGHT, ord("l"), ord("L"), ord("n"), ord("N"),
+             curses.KEY_ENTER, 10, 13, 32, curses.KEY_NPAGE)
+KEYS_HINT = (curses.KEY_F1, ord("?"), 9)       # F1, ? и Tab
+
+
+def view_lines(stdscr, title, lines, footer="Enter — продолжить"):
+    """Просмотр текста с прокруткой (↑/↓). Возвращает первую «не прокручивающую» клавишу.
+
+    Подвал всегда рисуется внизу экрана, поэтому подсказки по клавишам
+    не пропадают, даже если страница длиннее терминала.
+    """
+    set_cursor(False)
+    offset = 0
+    while True:
+        h, w = stdscr.getmaxyx()
+        width = max(20, w - 6)
+        wrapped = []
+        for line in lines:
+            wrapped.extend(wrap_line(line, width))
+
+        body_h = max(1, h - 7)
+        max_off = max(0, len(wrapped) - body_h)
+        offset = max(0, min(offset, max_off))
+
+        stdscr.erase()
+        safe_addstr(stdscr, 1, 2, f"🛡️ {title}", curses.A_BOLD)
+        safe_addstr(stdscr, 2, 2, "═" * min(58, max(10, w - 4)))
+        for i, row in enumerate(wrapped[offset:offset + body_h]):
+            safe_addstr(stdscr, 4 + i, 3, row)
+
+        if offset > 0:
+            safe_addstr(stdscr, 3, 3, "▲ выше (↑)")
+        if offset < max_off:
+            safe_addstr(stdscr, h - 3, 3, "▼ ещё ниже (↓)")
+
+        bar = footer + ("   ↑↓ прокрутка" if max_off else "")
+        safe_addstr(stdscr, h - 2, 2, bar, curses.A_BOLD)
+        stdscr.refresh()
+
+        key = stdscr.getch()
+        if key in (curses.KEY_UP, ord("k")):
+            offset -= 1
+        elif key in (curses.KEY_DOWN, ord("j")):
+            offset += 1
+        elif key == curses.KEY_HOME:
+            offset = 0
+        elif key == curses.KEY_END:
+            offset = max_off
+        elif key == curses.KEY_RESIZE or key == -1:
+            continue
+        else:
+            return key
 
 
 def clear():
@@ -461,86 +632,72 @@ def level():
     return progress["xp"] // 100 + 1
 
 
-def arrow_menu(stdscr, title, items, footer="↑/↓ выбор • Enter открыть • Esc назад"):
-    """Меню с управлением стрелками. Возвращает индекс выбранного пункта или None."""
-    curses.curs_set(0)
+def arrow_menu(stdscr, title, items, footer="↑/↓ выбор • Enter открыть • Esc назад",
+               prompt=None, hint=None):
+    """Меню со стрелками. Возвращает индекс выбранного пункта или None.
+
+    prompt — текст вопроса (виден всегда, переносится по ширине);
+    hint   — текст подсказки; открывается клавишами ? / F1 / Tab.
+    """
+    set_cursor(False)
+    if not items:
+        return None
     selected = 0
 
     while True:
-        stdscr.clear()
+        stdscr.erase()
         h, w = stdscr.getmaxyx()
-        stdscr.addstr(1, 2, f"🛡️ {title}", curses.A_BOLD)
-        stdscr.addstr(2, 2, "═" * min(58, max(10, w - 4)))
+        safe_addstr(stdscr, 1, 2, f"🛡️ {title}", curses.A_BOLD)
+        safe_addstr(stdscr, 2, 2, "═" * min(58, max(10, w - 4)))
+
+        y = 4
+        if prompt:
+            for line in (prompt if isinstance(prompt, list) else [prompt]):
+                for part in wrap_line(line, max(20, w - 6)):
+                    safe_addstr(stdscr, y, 3, part, curses.A_BOLD)
+                    y += 1
+            y += 1
 
         for i, item in enumerate(items):
-            y = 4 + i
-            if y >= h - 2:
+            if y >= h - 3:
                 break
             prefix = "➤ " if i == selected else "  "
             attr = curses.A_REVERSE | curses.A_BOLD if i == selected else curses.A_NORMAL
-            text_value = f"{prefix}{item}"
-            try:
-                stdscr.addstr(y, 2, text_value[:max(1, w - 4)], attr)
-            except curses.error:
-                pass
+            safe_addstr(stdscr, y, 2, f"{prefix}{item}", attr)
+            y += 1
 
-        try:
-            stdscr.addstr(h - 2, 2, footer[:max(1, w - 4)])
-        except curses.error:
-            pass
+        if hint:
+            safe_addstr(stdscr, h - 3, 2, " ? / Tab / F1  →  💡 ПОДСКАЗКА ", curses.A_REVERSE | curses.A_BOLD)
+        safe_addstr(stdscr, h - 2, 2, footer)
+        stdscr.refresh()
 
         key = stdscr.getch()
-        if key in (curses.KEY_UP, ord('k')):
+        if key in (curses.KEY_UP, ord("k")):
             selected = (selected - 1) % len(items)
-        elif key in (curses.KEY_DOWN, ord('j')):
+        elif key in (curses.KEY_DOWN, ord("j")):
             selected = (selected + 1) % len(items)
         elif key in (curses.KEY_ENTER, 10, 13):
             return selected
         elif key == 27:
             return None
+        elif hint and key in KEYS_HINT:
+            show_hint(stdscr, hint)
+        elif ord("1") <= key <= ord("9") and key - ord("1") < len(items):
+            selected = key - ord("1")
 
 
 def wait_key(stdscr, message="Нажми любую клавишу..."):
     h, w = stdscr.getmaxyx()
-    try:
-        stdscr.addstr(min(h - 2, 2), 2, message[:max(1, w - 4)])
-        stdscr.refresh()
-    except curses.error:
-        pass
+    safe_addstr(stdscr, h - 2, 2, message)
+    stdscr.refresh()
     stdscr.getch()
 
 
 def show_text(stdscr, title, lines, xp_message=None):
-    curses.curs_set(0)
-    while True:
-        stdscr.clear()
-        h, w = stdscr.getmaxyx()
-        stdscr.addstr(1, 2, f"🛡️ {title}", curses.A_BOLD)
-        stdscr.addstr(2, 2, "═" * min(58, max(10, w - 4)))
-
-        y = 4
-        for line in lines:
-            if y >= h - 3:
-                break
-            # Разбиваем длинные строки под размер терминала.
-            max_width = max(20, w - 6)
-            chunks = [line[i:i + max_width] for i in range(0, len(line), max_width)] or [""]
-            for chunk in chunks:
-                if y >= h - 3:
-                    break
-                try:
-                    stdscr.addstr(y, 3, chunk)
-                except curses.error:
-                    pass
-                y += 1
-            y += 1
-
-        if xp_message and y < h - 2:
-            stdscr.addstr(y, 3, xp_message, curses.A_BOLD)
-        wait_key(stdscr)
-        return
-
-
+    lines = list(lines)
+    if xp_message:
+        lines += ["", xp_message]
+    view_lines(stdscr, title, lines, "Enter — продолжить")
 
 
 ATTACKS = [
@@ -614,6 +771,64 @@ ATTACKS = [
         "defense": "Минимальные права, обновления, MFA, аудит sudo и контроль привилегированных действий.",
     },
 ]
+
+def paged_lesson(stdscr, title, pages, xp_amount=0, progress_key=None, done_title="🎓 УРОК ЗАВЕРШЁН", done_lines=None):
+    """Универсальный просмотр урока по страницам.
+
+    ← / h / Backspace — предыдущая страница
+    → / l / Enter / Space — следующая страница (на последней — завершить урок)
+    ↑ / ↓ — прокрутка длинной страницы
+    Esc / Q — выйти
+    """
+    page = 0
+    total = len(pages)
+
+    while True:
+        last = page == total - 1
+        footer = ("← назад   " if page > 0 else "") + \
+                 ("→ завершить урок" if last else "→ дальше") + "   Esc/Q — выйти"
+        key = view_lines(stdscr, f"{title} • {page + 1}/{total}", pages[page], footer)
+
+        if key in (27, ord("q"), ord("Q")):
+            return
+        if key in KEYS_PREV:
+            page = max(0, page - 1)
+        elif key in KEYS_NEXT:
+            page += 1
+            if page >= total:
+                break
+
+    first_time = not (progress_key and progress_key in progress["lessons"])
+    if xp_amount and first_time:
+        add_xp(xp_amount)
+    if progress_key:
+        progress["lessons"] = list(set(progress["lessons"] + [progress_key]))
+        save_progress()
+
+    if done_lines is not None:
+        lines = list(done_lines)
+        if not first_time:
+            lines = [ln for ln in lines if not ln.strip().endswith("XP")]
+            lines.append("(XP за этот урок уже начислены ранее)")
+        view_lines(stdscr, done_title, lines, "Enter — продолжить")
+
+
+def show_text_page(stdscr, title, lines):
+    """Совместимость: одна страница без ожидания (оставлено для старого кода)."""
+    set_cursor(False)
+    stdscr.erase()
+    h, w = stdscr.getmaxyx()
+    safe_addstr(stdscr, 1, 2, f"🛡️ {title}", curses.A_BOLD)
+    safe_addstr(stdscr, 2, 2, "═" * min(58, max(10, w - 4)))
+    y = 4
+    for line in lines:
+        for part in wrap_line(line, max(20, w - 6)):
+            if y >= h - 3:
+                break
+            safe_addstr(stdscr, y, 3, part)
+            y += 1
+    stdscr.refresh()
+
 
 def attacks_lesson(stdscr):
     pages = [
@@ -749,31 +964,24 @@ def attacks_lesson(stdscr):
         ],
     ]
 
-    for i, page in enumerate(pages, 1):
-        show_text(
-            stdscr,
-            f"📚 ОБУЧЕНИЕ • АТАКИ • {i}/{len(pages)}",
-            page + ["", "Enter → следующий раздел • Esc → выйти"]
-        )
-        key = stdscr.getch()
-        if key == 27:
-            return
-
-    add_xp(30)
-    progress["lessons"] = list(set(progress["lessons"] + ["attacks"]))
-    save_progress()
-
-    show_text(stdscr, "🎓 УРОК ЗАВЕРШЁН", [
-        "Ты изучил основные типы атак.",
-        "",
-        "+30 XP",
-        "",
-        "Теперь переходи в отдельный пункт:",
-        "🎯 Распознать атаку",
-        "",
-        "Там программа будет описывать процесс атаки,",
-        "а тебе нужно будет выбрать её название."
-    ])
+    paged_lesson(
+        stdscr,
+        "📚 ОБУЧЕНИЕ • АТАКИ",
+        pages,
+        xp_amount=30,
+        progress_key="attacks",
+        done_lines=[
+            "Ты изучил основные типы атак.",
+            "",
+            "+30 XP",
+            "",
+            "Теперь переходи в отдельный пункт:",
+            "🎯 Распознать атаку",
+            "",
+            "Там программа будет описывать процесс атаки,",
+            "а тебе нужно будет выбрать её название."
+        ]
+    )
 
 
 def attack_quiz(stdscr):
@@ -802,7 +1010,9 @@ def attack_quiz(stdscr):
             stdscr,
             "ВЫБЕРИ ОТВЕТ",
             choices,
-            "↑/↓ выбор • Enter • Esc"
+            "↑/↓ выбор • Enter • Esc",
+            prompt="🎯 Какой это тип атаки?",
+            hint=f"💡 Как от этого защищаются: {attack['defense']}",
         )
         if selected is None:
             return
@@ -857,6 +1067,27 @@ def ports_lesson(stdscr):
             "",
             "ОС использует номер порта, чтобы понять, "
             "какому приложению передать сетевое соединение."
+        ],
+        [
+            "🧮 SUBNETTING — ОСНОВЫ",
+            "",
+            "Subnetting — деление одной сети на несколько подсетей.",
+            "",
+            "Запомни логику:",
+            "IP + маска → адрес сети → диапазон хостов → broadcast",
+            "",
+            "Пример:",
+            "192.168.1.0/24",
+            "Маска: 255.255.255.0",
+            "Хосты: 192.168.1.1 — 192.168.1.254",
+            "Broadcast: 192.168.1.255",
+            "",
+            "Если /24 разделить на /26, получится 4 подсети.",
+            "В каждой /26: 64 адреса, из них обычно 62 адреса хостов.",
+            "",
+            "Главное правило для тренировки:",
+            "2^n = количество подсетей при заимствовании n бит.",
+            "2^h - 2 = количество обычных usable-хостов, где h — биты хостов."
         ],
         [
             "🔌 TCP И UDP",
@@ -949,28 +1180,21 @@ def ports_lesson(stdscr):
         ]
     ]
 
-    for i, page in enumerate(pages, 1):
-        show_text(
-            stdscr,
-            f"📚 ОБУЧЕНИЕ • ПОРТЫ • {i}/{len(pages)}",
-            page + ["", "Enter → следующий раздел • Esc → выйти"]
-        )
-        key = stdscr.getch()
-        if key == 27:
-            return
-
-    add_xp(20)
-    progress["lessons"] = list(set(progress["lessons"] + ["ports"]))
-    save_progress()
-
-    show_text(stdscr, "🎓 УРОК ЗАВЕРШЁН", [
-        "Ты изучил основы сетевых портов.",
-        "",
-        "+20 XP",
-        "",
-        "Теперь переходи в отдельный пункт 🌐 Знание портов,",
-        "чтобы проверить себя."
-    ])
+    paged_lesson(
+        stdscr,
+        "📚 ОБУЧЕНИЕ • ПОРТЫ",
+        pages,
+        xp_amount=20,
+        progress_key="ports",
+        done_lines=[
+            "Ты изучил основы сетевых портов.",
+            "",
+            "+20 XP",
+            "",
+            "Теперь переходи в отдельный пункт 🌐 Знание портов,",
+            "чтобы проверить себя."
+        ]
+    )
 
 
 # ============================================================
@@ -985,6 +1209,8 @@ COMMANDS = [
     ("Interfaces", "Как посмотреть IP-адреса интерфейсов Linux?", "ip addr"),
     ("Routing", "Как посмотреть таблицу маршрутизации Cisco?", "show ip route"),
     ("Routing", "Как посмотреть таблицу маршрутизации Linux?", "ip route"),
+    ("Subnetting", "Какой prefix обозначает маску 255.255.255.192?", "/26"),
+    ("Subnetting", "Сколько usable-хостов в /26?", "62"),
     ("VLAN", "Как посмотреть VLAN и порты?", "show vlan brief"),
     ("Trunk", "Как проверить trunk и разрешённые VLAN?", "show interfaces trunk"),
     ("EtherChannel", "Как проверить состояние EtherChannel?", "show etherchannel summary"),
@@ -1529,36 +1755,28 @@ def command_matches(user, answer):
 # ============================================================
 
 def draw_box(stdscr, title, lines, selected=0, footer=None):
-    stdscr.clear()
+    stdscr.erase()
     h, w = stdscr.getmaxyx()
 
     border = "═"
-    width = min(w - 4, 78)
+    width = max(20, min(w - 4, 78))
     left = max(1, (w - width) // 2)
 
-    stdscr.addstr(1, left, "╔" + border * (width - 2) + "╗")
-    title_text = f"  {title}  "
-    stdscr.addstr(2, left, "║" + title_text.center(width - 2) + "║")
-    stdscr.addstr(3, left, "╠" + border * (width - 2) + "╣")
+    safe_addstr(stdscr, 1, left, "╔" + border * (width - 2) + "╗")
+    safe_addstr(stdscr, 2, left, "║" + f"  {title}  ".center(width - 2) + "║")
+    safe_addstr(stdscr, 3, left, "╠" + border * (width - 2) + "╣")
 
     y = 4
-
-    for i, line in enumerate(lines):
-        if y >= h - 3:
-            break
-
-        wrapped = textwrap.wrap(str(line), width=max(10, width - 8)) or [""]
-        for part in wrapped:
+    for line in lines:
+        for part in wrap_line(line, max(10, width - 8)):
             if y >= h - 3:
                 break
-            stdscr.addstr(y, left + 3, part[:width - 6])
+            safe_addstr(stdscr, y, left + 3, part[:width - 6])
             y += 1
 
+    safe_addstr(stdscr, min(h - 3, y), left, "╚" + border * (width - 2) + "╝")
     if footer:
-        footer_y = h - 2
-        stdscr.addstr(footer_y, left + 2, footer[:width - 4])
-
-    stdscr.addstr(min(h - 1, y), left, "╚" + border * (width - 2) + "╝")
+        safe_addstr(stdscr, h - 2, left + 2, footer[:width - 4], curses.A_BOLD)
     stdscr.refresh()
 
 
@@ -1611,43 +1829,117 @@ def menu(stdscr, title, items, subtitle="↑↓ выбор   Enter — выбр�
 # INPUT
 # ============================================================
 
-def input_screen(stdscr, title, lines, prompt="> "):
-    stdscr.clear()
-    h, w = stdscr.getmaxyx()
-
-    y = 1
-
-    stdscr.addstr(y, 2, "═" * min(w - 4, 78))
-    y += 1
-
-    stdscr.addstr(y, 2, title[:w - 4], curses.A_BOLD)
-    y += 2
-
-    for line in lines:
-        for part in textwrap.wrap(str(line), width=max(20, w - 6)) or [""]:
-            if y >= h - 4:
-                break
-            stdscr.addstr(y, 3, part)
-            y += 1
-
-    y += 1
-    stdscr.addstr(y, 3, prompt)
-    curses.echo()
-    curses.curs_set(1)
-
-    answer = stdscr.getstr(y, 3 + len(prompt), max(1, w - 8)).decode(
-        "utf-8", errors="ignore"
+def input_screen(stdscr, title, lines, prompt="> ", hint_text=None):
+    """Простой ввод ответа. Если передан hint_text — работает кнопка подсказки."""
+    answer, action = scenario_input_screen(
+        stdscr, title, lines, "", hint_text=hint_text or "💡 Подумай, какая команда подходит под описание."
     )
-
-    curses.noecho()
-    curses.curs_set(0)
-
-    return answer
+    return answer if action == "answer" else ""
 
 
 def message(stdscr, title, lines):
     draw_box(stdscr, title, lines, footer="Enter — продолжить")
     stdscr.getch()
+
+
+def show_hint(stdscr, hint):
+    """Экран подсказки (не раскрывает точный ответ)."""
+    draw_box(
+        stdscr,
+        "💡 ПОДСКАЗКА",
+        [
+            hint,
+            "",
+            "Подсказка не снимает жизнь и не считается ошибкой.",
+        ],
+        footer="Enter — вернуться к вопросу",
+    )
+    stdscr.getch()
+
+
+SCENARIO_HINTS = {
+    "show ip interface brief": "💡 Подумай о состоянии интерфейсов: up/down и наличии IP-адресов.",
+    "show ip route": "💡 Нужно посмотреть, какие сети и через какие направления известны роутеру.",
+    "show ip arp": "💡 Проверь соответствие IP-адресов и MAC-адресов в локальном сегменте.",
+    "show vlan brief": "💡 Проверь, в каких VLAN находятся порты и существуют ли нужные VLAN.",
+    "show interfaces trunk": "💡 Нужно проверить trunk, его VLAN и разрешённые VLAN.",
+    "show etherchannel summary": "💡 Проверь состояние EtherChannel и отдельных физических портов.",
+    "show ip ospf neighbor": "💡 Ищи информацию именно о соседях, с которыми OSPF установил отношения.",
+    "show ip ospf interface": "💡 Проверь параметры OSPF непосредственно на интерфейсах.",
+    "show ip protocols": "💡 Проверь настройки и объявления маршрутов протокола маршрутизации.",
+    "show standby": "💡 Проверь состояние HSRP: active/standby и виртуальный IP.",
+    "ip addr": "💡 Нужно увидеть интерфейсы Linux и назначенные им IP-адреса.",
+    "ip route": "💡 Нужно увидеть таблицу маршрутов Linux и шлюз по умолчанию.",
+    "ip neigh": "💡 Нужна таблица соседей (ARP) на Linux-хосте.",
+    "ping": "💡 Нужна простая проверка доступности узла по IP.",
+    "traceroute": "💡 Нужно увидеть путь пакетов и место, где он перестаёт проходить.",
+}
+
+
+def scenario_hint_text(answer):
+    return SCENARIO_HINTS.get(
+        norm(answer),
+        "💡 Подумай, какую информацию нужно проверить на этом этапе диагностики.",
+    )
+
+
+def scenario_hint(stdscr, question, answer):
+    show_hint(stdscr, scenario_hint_text(answer))
+
+
+def command_hint_text(category, answer):
+    words = answer.split()
+    return (
+        f"💡 Категория: {category}. "
+        f"Команда состоит из {len(words)} слов(а) и начинается с «{words[0]}»."
+    )
+
+
+def scenario_input_screen(stdscr, title, lines, answer, hint_question=None, hint_text=None):
+    """Ввод команды с ВСЕГДА видимой кнопкой подсказки внизу экрана.
+
+    ? / Tab / F1 — подсказка, Enter — ответ, Esc — выйти.
+    Возвращает (текст, "answer") или (None, "exit").
+    """
+    buffer = ""
+    if hint_text is None:
+        hint_text = scenario_hint_text(answer)
+
+    while True:
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        safe_addstr(stdscr, 1, 2, "═" * min(w - 4, 78))
+        safe_addstr(stdscr, 2, 2, title, curses.A_BOLD)
+
+        y = 4
+        for line in lines:
+            for part in wrap_line(line, max(20, w - 6)):
+                if y >= h - 7:
+                    break
+                safe_addstr(stdscr, y, 3, part)
+                y += 1
+
+        input_row = min(y + 1, h - 5)
+        safe_addstr(stdscr, input_row, 3, "Команда: " + buffer + "█", curses.A_BOLD)
+
+        safe_addstr(stdscr, h - 3, 2, " ? / Tab / F1  →  💡 ПОДСКАЗКА ", curses.A_REVERSE | curses.A_BOLD)
+        safe_addstr(stdscr, h - 2, 2, "Enter — ответить   Backspace — стереть   Esc — выйти")
+        stdscr.refresh()
+
+        key = stdscr.getch()
+
+        if key in KEYS_HINT:
+            show_hint(stdscr, hint_text)
+            continue
+        if key == 27:
+            return None, "exit"
+        if key in (curses.KEY_BACKSPACE, 127, 8):
+            buffer = buffer[:-1]
+            continue
+        if key in (10, 13, curses.KEY_ENTER):
+            return buffer, "answer"
+        if 32 <= key <= 126 and len(buffer) < max(1, w - 18):
+            buffer += chr(key)
 
 
 # ============================================================
@@ -1667,6 +1959,7 @@ def command_mode(stdscr, stats):
             "",
             "Не подглядывай. Введи команду полностью.",
         ],
+        hint_text=command_hint_text(category, answer),
     )
 
     if command_matches(user, answer):
@@ -1704,126 +1997,203 @@ def command_mode(stdscr, stats):
 # SCENARIO MODE
 # ============================================================
 
+def choose_scenario_difficulty(stdscr, scenario):
+    """Выбор сложности перед прохождением схемы."""
+    while True:
+        draw_box(
+            stdscr,
+            f"🎚️ УРОВЕНЬ — {scenario['name']}",
+            [
+                "Выбери, как хочешь проходить эту схему:",
+                "",
+                "🟢 1 — ЛЁГКИЙ",
+                "   Без жизней. Можно ошибаться сколько угодно и спокойно продолжать.",
+                "",
+                "🔴 2 — ТЯЖЁЛЫЙ",
+                "   3 ❤️. Ошибка −1 жизнь, правильный ответ +1 жизнь (максимум 3).",
+                "   При потере всех жизней — проигрыш и возможность начать заново.",
+                "",
+                "1/2 — выбрать   Q/Esc — назад",
+            ],
+        )
+        key = stdscr.getch()
+        if key == ord("1"):
+            return "easy"
+        if key == ord("2"):
+            return "hard"
+        if key in (ord("q"), ord("Q"), 27):
+            return None
+
+
 def scenario_mode_selected(stdscr, stats, scenario):
-    """Прохождение схемы с 3 жизнями. Ошибка снимает жизнь, но не раскрывает ответ."""
+    """Прохождение схемы в лёгком или тяжёлом режиме."""
+    difficulty = choose_scenario_difficulty(stdscr, scenario)
+    if difficulty is None:
+        return
+
+    hard_mode = difficulty == "hard"
+
     while True:
         lives = 3
         wrong_in_run = 0
 
-        draw_box(
+        if hard_mode:
+            intro_lives = "❤️❤️❤️  Жизни: 3"
+            intro_mode = "🔴 ТЯЖЁЛЫЙ УРОВЕНЬ — ошибки снимают жизни"
+        else:
+            intro_lives = "♾️  Жизни отключены — можно спокойно учиться"
+            intro_mode = "🟢 ЛЁГКИЙ УРОВЕНЬ — без жизней"
+
+        key = view_lines(
             stdscr,
             f"🌐 СХЕМА: {scenario['name']}",
             [
-                scenario["diagram"],
+                *scenario["diagram"].strip("\n").split("\n"),
                 "",
                 "🚨 СИТУАЦИЯ:",
                 scenario["problem"],
                 "",
-                "❤️❤️❤️  Жизни: 3",
-                "",
-                "Enter — начать диагностику",
-                "Q — назад к списку",
+                intro_mode,
+                intro_lives,
             ],
+            "Enter — начать диагностику   Q/Esc — назад",
         )
-
-        key = stdscr.getch()
         if key in (ord("q"), ord("Q"), 27):
             return
 
         for number, (question, answer, explanation) in enumerate(scenario["steps"], 1):
             while True:
-                hearts = "❤️" * lives + "🖤" * (3 - lives)
-                user = input_screen(
+                if hard_mode:
+                    hearts = "❤️" * lives + "🖤" * (3 - lives)
+                    status = f"Жизни: {hearts}   Ошибок: {wrong_in_run}"
+                else:
+                    status = f"🟢 Лёгкий уровень   Ошибок: {wrong_in_run}"
+
+                user, action = scenario_input_screen(
                     stdscr,
                     f"🔎 ДИАГНОСТИКА — ШАГ {number}",
                     [
                         f"Схема: {scenario['name']}",
                         "",
-                        f"Жизни: {hearts}   Ошибок: {wrong_in_run}",
+                        status,
                         "",
                         f"Ситуация: {scenario['problem']}",
                         "",
                         question,
                         "",
-                        "Введи команду:",
                     ],
+                    answer,
+                    question,
                 )
+
+                if action == "exit":
+                    return
 
                 if command_matches(user, answer):
                     stats["correct"] += 1
                     stats["streak"] += 1
-                    draw_box(
-                        stdscr,
-                        f"✅ ПРАВИЛЬНО — ШАГ {number}",
-                        [
+
+                    if hard_mode:
+                        old_lives = lives
+                        lives = min(3, lives + 1)
+                        recovered = lives > old_lives
+                        result_lines = [
                             f"Команда: {answer}",
                             "",
                             f"❤️ Жизни: {lives}/3",
-                            "",
+                            "" if not recovered else "💚 +1 жизнь за правильный ответ!",
                             "➡️ Переходим к следующему шагу.",
-                        ],
+                        ]
+                    else:
+                        result_lines = [
+                            f"Команда: {answer}",
+                            "",
+                            "🟢 Ошибка не влияет на прохождение.",
+                            "➡️ Переходим к следующему шагу.",
+                        ]
+
+                    draw_box(
+                        stdscr,
+                        f"✅ ПРАВИЛЬНО — ШАГ {number}",
+                        result_lines,
                         footer="Enter — следующий шаг",
                     )
                     stdscr.getch()
                     break
 
-                # Неверный ответ: жизнь снимается, но правильный ответ/объяснение
-                # автоматически НЕ показываются.
                 stats["wrong"] += 1
                 stats["streak"] = 0
                 stats["mistakes"].append(answer)
                 wrong_in_run += 1
-                lives -= 1
 
-                if lives <= 0:
-                    while True:
-                        draw_box(
-                            stdscr,
-                            "💀 ВЫ ПРОИГРАЛИ",
-                            [
-                                "У тебя закончились все 3 жизни.",
-                                "",
-                                f"Схема: {scenario['name']}",
-                                f"Ошибок в этом прохождении: {wrong_in_run}",
-                                "",
-                                "🔄 1 — начать эту схему заново",
-                                "🏠 2 — выйти в главное меню сетевого тренажёра",
-                                "",
-                                "Выбери действие:",
-                            ],
-                        )
-                        key = stdscr.getch()
-                        if key == ord("1"):
-                            break
-                        if key == ord("2") or key in (ord("q"), ord("Q"), 27):
-                            return
-                    # Перезапускаем всю схему с 3 жизнями.
-                    break
+                if hard_mode:
+                    lives -= 1
 
-                draw_box(
-                    stdscr,
-                    "❌ НЕПРАВИЛЬНО",
-                    [
-                        "Ответ неверный.",
-                        "",
-                        f"❤️ Осталось жизней: {lives}/3",
-                        "",
-                        "Правильный ответ НЕ показывается.",
-                        "Продумай следующий шаг самостоятельно.",
-                    ],
-                    footer="Enter — продолжить",
-                )
-                stdscr.getch()
+                    if lives <= 0:
+                        while True:
+                            draw_box(
+                                stdscr,
+                                "💀 ВЫ ПРОИГРАЛИ",
+                                [
+                                    "У тебя закончились все 3 жизни.",
+                                    "",
+                                    f"Схема: {scenario['name']}",
+                                    f"Ошибок в этом прохождении: {wrong_in_run}",
+                                    "",
+                                    "🔄 1 — начать эту схему заново",
+                                    "🏠 2 — выйти в главное меню сетевого тренажёра",
+                                    "",
+                                    "Выбери действие:",
+                                ],
+                            )
+                            key = stdscr.getch()
+                            if key == ord("1"):
+                                break
+                            if key == ord("2") or key in (ord("q"), ord("Q"), 27):
+                                return
+                        break
+
+                    draw_box(
+                        stdscr,
+                        "❌ НЕПРАВИЛЬНО",
+                        [
+                            "Ответ неверный.",
+                            "",
+                            "💔 -1 жизнь",
+                            f"❤️ Осталось жизней: {lives}/3",
+                            "",
+                            "Правильный ответ НЕ показывается.",
+                            "? / Tab / F1 — подсказка, если нужна помощь.",
+                        ],
+                        footer="Enter — продолжить",
+                    )
+                    stdscr.getch()
+                else:
+                    draw_box(
+                        stdscr,
+                        "❌ НЕПРАВИЛЬНО",
+                        [
+                            "Ответ неверный, но это учебный режим.",
+                            "",
+                            "🟢 Жизни не отнимаются.",
+                            "Можно попробовать ещё раз.",
+                            "",
+                            "Правильный ответ НЕ показывается.",
+                            "? / Tab / F1 — подсказка, если нужна помощь.",
+                        ],
+                        footer="Enter — попробовать ещё раз",
+                    )
+                    stdscr.getch()
 
         else:
-            # Все шаги пройдены — схема завершена.
+            final_lives = f"❤️ Осталось жизней: {lives}/3" if hard_mode else "🟢 Режим обучения — без жизней"
             draw_box(
                 stdscr,
                 "🏁 СХЕМА ЗАВЕРШЕНА",
                 [
                     f"{scenario['name']}",
                     "",
-                    f"❤️ Осталось жизней: {lives}/3",
+                    final_lives,
                     f"Ошибок в прохождении: {wrong_in_run}",
                     "",
                     "Отлично! Ты полностью прошёл диагностику.",
@@ -1833,9 +2203,7 @@ def scenario_mode_selected(stdscr, stats, scenario):
             stdscr.getch()
             return
 
-        # Если дошли сюда из-за проигрыша и выбрали «1», начинаем заново.
         continue
-
 
 def scenario_mode(stdscr, stats):
     """Запускает одну случайную схему и возвращает в меню после её завершения."""
@@ -1883,6 +2251,7 @@ def mistakes_mode(stdscr, stats):
     if not questions:
         questions = [f"Вспомни команду: {answer}"]
 
+    category_for_hint = next((c for c, _, a in COMMANDS if a == answer), "команда")
     user = input_screen(
         stdscr,
         "🔥 ПОВТОР ОШИБОК",
@@ -1891,6 +2260,7 @@ def mistakes_mode(stdscr, stats):
             "",
             "Эта команда была ошибочной ранее.",
         ],
+        hint_text=command_hint_text(category_for_hint, answer),
     )
 
     if command_matches(user, answer):
@@ -1924,19 +2294,8 @@ def mistakes_mode(stdscr, stats):
 # ============================================================
 
 def command_list(stdscr):
-    lines = []
-
-    for category, question, answer in COMMANDS:
-        lines.append(f"{category:<15} {answer}")
-
-    draw_box(
-        stdscr,
-        "📚 КОМАНДЫ",
-        lines,
-        footer="Enter — назад",
-    )
-
-    stdscr.getch()
+    lines = [f"{category:<15} {answer}" for category, question, answer in COMMANDS]
+    view_lines(stdscr, "📚 КОМАНДЫ", lines, "Enter — назад")
 
 
 # ============================================================
@@ -1944,48 +2303,73 @@ def command_list(stdscr):
 # ============================================================
 
 def scenario_list(stdscr, stats):
-    """Интерактивный список всех схем и ситуаций.
+    """Список схем с прямой навигацией по страницам.
 
-    Стрелки выбирают конкретную ситуацию, Enter запускает её.
-    Q возвращает в меню сетевого тренажёра.
+    ↑↓ — выбор ситуации
+    ←/→ — мгновенно сменить страницу
+    Enter — открыть ситуацию
+    Q/Esc — назад
     """
     page_size = 10
     page = 0
+    selected = 0
 
     while True:
-        total_pages = (len(SCENARIOS) + page_size - 1) // page_size
+        total_pages = max(1, (len(SCENARIOS) + page_size - 1) // page_size)
+        page = max(0, min(page, total_pages - 1))
+
         start = page * page_size
         end = min(start + page_size, len(SCENARIOS))
+        count = end - start
 
-        items = [
-            f"{i + 1:02d}. {SCENARIOS[i]['name']}"
-            for i in range(start, end)
-        ]
-
-        items += ["← Предыдущая страница", "→ Следующая страница", "↩ Назад"]
-
-        selected = menu(
-            stdscr,
-            f"🗺 СХЕМЫ И СИТУАЦИИ  {page + 1}/{total_pages}",
-            items,
-            "↑↓ выбор   Enter — открыть   Q — назад",
-        )
-
-        if selected is None or selected == len(items) - 1:
+        if count <= 0:
             return
 
-        if selected == len(items) - 3:
+        selected = min(selected, count - 1)
+
+        lines = []
+        for i in range(start, end):
+            prefix = "➜ " if i - start == selected else "  "
+            lines.append(prefix + f"{i + 1:02d}. {SCENARIOS[i]['name']}")
+
+        lines += [
+            "",
+            f"Страница {page + 1}/{total_pages}",
+            "← Предыдущая страница    → Следующая страница",
+        ]
+
+        draw_box(
+            stdscr,
+            f"🗺 СХЕМЫ И СИТУАЦИИ  {page + 1}/{total_pages}",
+            lines,
+            selected,
+            "↑↓ — выбрать   ←/→ — страница   Enter — открыть   Q/Esc — назад",
+        )
+
+        key = stdscr.getch()
+
+        if key in (curses.KEY_UP, ord("k")):
+            selected = (selected - 1) % count
+
+        elif key in (curses.KEY_DOWN, ord("j")):
+            selected = (selected + 1) % count
+
+        elif key in (curses.KEY_LEFT, ord("h")):
             if page > 0:
                 page -= 1
-            continue
+                selected = 0
 
-        if selected == len(items) - 2:
+        elif key in (curses.KEY_RIGHT, ord("l")):
             if page < total_pages - 1:
                 page += 1
-            continue
+                selected = 0
 
-        scenario = SCENARIOS[start + selected]
-        scenario_mode_selected(stdscr, stats, scenario)
+        elif key in (10, 13, curses.KEY_ENTER):
+            scenario = SCENARIOS[start + selected]
+            scenario_mode_selected(stdscr, stats, scenario)
+
+        elif key in (ord("q"), ord("Q"), 27):
+            return
 
 
 # ============================================================
@@ -2035,15 +2419,18 @@ def network_statistics(stdscr, stats):
 # MAIN MENU
 # ============================================================
 
-def network_trainer_menu(stdscr):
-    curses.curs_set(0)
+NETWORK_STATS = {
+    "correct": 0,
+    "wrong": 0,
+    "streak": 0,
+    "mistakes": [],
+}
 
-    stats = {
-        "correct": 0,
-        "wrong": 0,
-        "streak": 0,
-        "mistakes": [],
-    }
+
+def network_trainer_menu(stdscr):
+    set_cursor(False)
+
+    stats = NETWORK_STATS
 
     menu_items = [
         "🧠 Вспомнить команду",
@@ -2124,75 +2511,91 @@ def lesson_menu(stdscr):
             network_trainer_menu(stdscr)
             continue
 
-        # После добавления новых уроков индексы остальных тем сдвинулись.
-        if choice < 2:
-            key = str(choice + 1)
-        else:
-            key = str(choice)
+        # Явное соответствие пункта меню и ключа в LESSONS (раньше индексы «ехали»).
+        key = {0: "1", 4: "3", 5: "4", 6: "5", 7: "6"}.get(choice)
+        if key is None or key not in LESSONS:
+            continue
 
         title, items = LESSONS[key]
         lines = []
         for command, explanation in items:
-            lines.extend([f"💻 {command}", f"   → {explanation}"])
-        progress["lessons"] = list(set(progress["lessons"] + [key]))
-        add_xp(10)
-        save_progress()
-        show_text(stdscr, title, lines, "+10 XP  •  Тема отмечена как изученная")
+            lines.extend([f"💻 {command}", f"   → {explanation}", ""])
+        if key in progress["lessons"]:
+            note = "Тема уже изучена ранее (XP начисляется один раз)"
+        else:
+            progress["lessons"] = list(set(progress["lessons"] + [key]))
+            add_xp(10)
+            save_progress()
+            note = "+10 XP  •  Тема отмечена как изученная"
+        show_text(stdscr, title, lines, note)
 
 
 def quiz(stdscr):
     questions = QUESTIONS[:]
     random.shuffle(questions)
+    questions = questions[:5]
+    total_q = len(questions)
 
-    for i, item in enumerate(questions[:5], 1):
+    for i, item in enumerate(questions, 1):
         options = item["options"]
+        visible = list(range(len(options)))   # индексы вариантов, которые ещё показаны
+        hint_used = False
         selected = 0
         while True:
-            stdscr.clear()
+            stdscr.erase()
             h, w = stdscr.getmaxyx()
-            stdscr.addstr(1, 2, "🧠 ТЕСТ", curses.A_BOLD)
-            stdscr.addstr(2, 2, "═" * min(58, max(10, w - 4)))
-            stdscr.addstr(4, 2, f"Вопрос {i}/5")
+            safe_addstr(stdscr, 1, 2, "🧠 ТЕСТ", curses.A_BOLD)
+            safe_addstr(stdscr, 2, 2, "═" * min(58, max(10, w - 4)))
+            safe_addstr(stdscr, 4, 2, f"Вопрос {i}/{total_q}")
 
             y = 6
-            q_lines = [item["q"][j:j + max(20, w - 6)] for j in range(0, len(item["q"]), max(20, w - 6))]
-            for line in q_lines:
-                stdscr.addstr(y, 3, line)
+            for part in wrap_line(item["q"], max(20, w - 6)):
+                safe_addstr(stdscr, y, 3, part, curses.A_BOLD)
                 y += 1
             y += 1
 
-            for idx, option in enumerate(options):
-                attr = curses.A_REVERSE | curses.A_BOLD if idx == selected else curses.A_NORMAL
-                prefix = "➤ " if idx == selected else "  "
-                try:
-                    stdscr.addstr(y + idx, 3, (prefix + option)[:max(1, w - 6)], attr)
-                except curses.error:
-                    pass
+            for pos, idx in enumerate(visible):
+                attr = curses.A_REVERSE | curses.A_BOLD if pos == selected else curses.A_NORMAL
+                prefix = "➤ " if pos == selected else "  "
+                safe_addstr(stdscr, y + pos, 3, prefix + options[idx], attr)
 
-            stdscr.addstr(h - 2, 2, "↑/↓ выбор • Enter ответ • Esc выйти")
+            if not hint_used:
+                safe_addstr(stdscr, h - 3, 2, " ? / Tab / F1  →  💡 ПОДСКАЗКА (убрать 2 неверных) ", curses.A_REVERSE | curses.A_BOLD)
+            safe_addstr(stdscr, h - 2, 2, "↑/↓ выбор • Enter ответ • Esc выйти")
+            stdscr.refresh()
+
             key = stdscr.getch()
-            if key in (curses.KEY_UP, ord('k')):
-                selected = (selected - 1) % len(options)
-            elif key in (curses.KEY_DOWN, ord('j')):
-                selected = (selected + 1) % len(options)
+            if key in (curses.KEY_UP, ord("k")):
+                selected = (selected - 1) % len(visible)
+            elif key in (curses.KEY_DOWN, ord("j")):
+                selected = (selected + 1) % len(visible)
             elif key in (curses.KEY_ENTER, 10, 13):
                 break
             elif key == 27:
                 return
+            elif key in KEYS_HINT and not hint_used:
+                hint_used = True
+                correct_idx = ord(item["answer"]) - ord("A")
+                wrong = [idx for idx in visible if idx != correct_idx]
+                for idx in random.sample(wrong, min(2, len(wrong))):
+                    visible.remove(idx)
+                selected = 0
 
         progress["tests"] += 1
-        chosen_letter = chr(ord('A') + selected)
+        chosen_letter = chr(ord("A") + visible[selected])
         if chosen_letter == item["answer"]:
             progress["correct"] += 1
-            add_xp(20)
-            result = ["✅ Правильно! +20 XP", f"💡 {item['explain']}"]
+            gained = 10 if hint_used else 20
+            add_xp(gained)
+            result = [f"✅ Правильно! +{gained} XP" + (" (с подсказкой)" if hint_used else ""),
+                      f"💡 {item['explain']}"]
         else:
             result = [
                 f"❌ Неправильно. Правильный ответ: {item['answer']}",
                 f"💡 {item['explain']}"
             ]
         save_progress()
-        show_text(stdscr, f"Результат — вопрос {i}/5", result)
+        show_text(stdscr, f"Результат — вопрос {i}/{total_q}", result)
 
 
 def show_knowledge(stdscr, command, points):
@@ -2253,7 +2656,9 @@ def incident_mode(stdscr):
             stdscr,
             f"СТАЖЁР SOC • ШАГ {step_no}/{len(incident['steps'])}",
             labels,
-            "↑/↓ выбор • Enter выполнить действие • Esc выйти"
+            "↑/↓ выбор • Enter выполнить действие • Esc выйти",
+            prompt=[incident["title"], "", step.get("question", "Что делаешь дальше?")],
+            hint=step["hint"],
         )
         if selected is None:
             return
@@ -2383,6 +2788,149 @@ PORTS = [
     (8080, "HTTP-alt", "Альтернативный HTTP-порт"),
 ]
 
+SUBNETTING_QUESTIONS = [
+    {
+        "q": "Какая маска соответствует /24?",
+        "choices": ["255.255.255.0", "255.255.0.0", "255.255.255.128", "255.255.255.192"],
+        "answer": 0,
+        "explain": "/24 означает 24 бита сети: 255.255.255.0."
+    },
+    {
+        "q": "Сколько обычных usable-хостов в сети /26?",
+        "choices": ["30", "62", "64", "126"],
+        "answer": 1,
+        "explain": "В /26 остаётся 6 бит хостов: 2^6 - 2 = 62 usable-хоста."
+    },
+    {
+        "q": "Сколько подсетей получится из /24, если разделить её на /26?",
+        "choices": ["2", "4", "8", "16"],
+        "answer": 1,
+        "explain": "Из /24 в /26 заимствованы 2 бита: 2^2 = 4 подсети."
+    },
+    {
+        "q": "Какой broadcast у сети 192.168.10.0/24?",
+        "choices": ["192.168.10.1", "192.168.10.254", "192.168.10.255", "192.168.11.255"],
+        "answer": 2,
+        "explain": "В /24 последний адрес диапазона — broadcast: .255."
+    },
+    {
+        "q": "Какая маска соответствует /26?",
+        "choices": ["255.255.255.0", "255.255.255.128", "255.255.255.192", "255.255.255.224"],
+        "answer": 2,
+        "explain": "/26 = 255.255.255.192."
+    },
+    {
+        "q": "Какой адрес является адресом сети для 192.168.10.70/26?",
+        "choices": ["192.168.10.0", "192.168.10.64", "192.168.10.70", "192.168.10.128"],
+        "answer": 1,
+        "explain": "Размер блока /26 равен 64: диапазоны начинаются с .0, .64, .128, .192."
+    },
+    {
+        "q": "Какой диапазон usable-хостов у 192.168.10.64/26?",
+        "choices": [".64-.127", ".65-.126", ".65-.127", ".64-.126"],
+        "answer": 1,
+        "explain": "Сеть .64, broadcast .127, поэтому usable-хосты .65-.126."
+    },
+    {
+        "q": "Какой prefix нужен для сети примерно на 14 usable-хостов?",
+        "choices": ["/28", "/29", "/30", "/27"],
+        "answer": 0,
+        "explain": "/28 оставляет 4 бита хостов: 2^4 - 2 = 14 usable-хостов."
+    },
+    {
+        "q": "Какая сеть содержит адрес 10.10.10.130/25?",
+        "choices": ["10.10.10.0/25", "10.10.10.64/25", "10.10.10.128/25", "10.10.10.192/25"],
+        "answer": 2,
+        "explain": "/25 делит последний октет на блоки 0-127 и 128-255."
+    },
+    {
+        "q": "Какой broadcast у сети 10.0.0.0/30?",
+        "choices": ["10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4"],
+        "answer": 2,
+        "explain": "/30 содержит 4 адреса: сеть .0, два хоста .1-.2, broadcast .3."
+    },
+]
+
+
+def subnetting_quiz(stdscr):
+    """Тренажёр subnetting: маски, подсети, хосты, network/broadcast."""
+    score = 0
+    lives = 3
+    questions = random.sample(SUBNETTING_QUESTIONS, min(8, len(SUBNETTING_QUESTIONS)))
+
+    show_text(stdscr, "🧮 ТРЕНАЖЁР SUBNETTING", [
+        "Учимся считать сеть, а не зубрить маски.",
+        "",
+        "❤️ Ошибка: -1 жизнь",
+        "❤️ Правильный ответ: +1 жизнь (максимум 3)",
+        "",
+        "Смотри на IP + prefix и определяй network / hosts / broadcast.",
+    ])
+
+    for number, item in enumerate(questions, 1):
+        choices = item["choices"]
+        selected = arrow_menu(
+            stdscr,
+            f"🧮 SUBNETTING • {number}/{len(questions)} • {'❤️' * lives + '🖤' * (3-lives)}",
+            choices,
+            "↑↓ выбор • Enter • Esc — выйти",
+            prompt=item["q"],
+            hint="💡 Определи размер блока по маске: 256 − значение октета маски. "
+                 "Network — начало блока, broadcast — его последний адрес, "
+                 "хостов = размер блока − 2.",
+        )
+        if selected is None:
+            return
+
+        if selected == item["answer"]:
+            score += 1
+            lives = min(3, lives + 1)
+            result = [
+                "✅ ПРАВИЛЬНО!",
+                "",
+                f"❤️ Жизни: {lives}/3",
+                f"+1 балл",
+                "",
+                item["explain"],
+            ]
+        else:
+            lives -= 1
+            result = [
+                "❌ НЕПРАВИЛЬНО",
+                "",
+                f"❤️ Жизни: {lives}/3",
+                "",
+                "Не спеши. Посчитай блок адресов и границы сети.",
+            ]
+
+        show_text(stdscr, "📐 РАЗБОР", result)
+
+        if lives <= 0:
+            show_text(stdscr, "💀 SUBNETTING — ЖИЗНИ ЗАКОНЧИЛИСЬ", [
+                f"Результат: {score}/{number}",
+                "",
+                "Повтори тренировку ещё раз.",
+                "Подсказка: сначала определи размер блока по маске.",
+            ])
+            return
+
+    add_xp(score * 10)
+    progress["tests"] += 1
+    progress["correct"] += score
+    save_progress()
+
+    accuracy = round(score / len(questions) * 100)
+    show_text(stdscr, "🏁 РЕЗУЛЬТАТ: SUBNETTING", [
+        f"Правильных ответов: {score}/{len(questions)}",
+        f"Точность: {accuracy}%",
+        f"❤️ Осталось жизней: {lives}/3",
+        f"✨ XP: +{score * 10}",
+        "",
+        "Главная схема:",
+        "IP + prefix → размер блока → network → hosts → broadcast",
+    ])
+
+
 def ports_quiz(stdscr):
     score = 0
     questions = random.sample(PORTS, min(8, len(PORTS)))
@@ -2403,7 +2951,9 @@ def ports_quiz(stdscr):
                 stdscr,
                 f"🌐 ПОРТЫ • {number}/TCP",
                 choices,
-                "Какой сервис обычно связан с этим портом?"
+                "↑/↓ выбор • Enter • Esc — выйти",
+                prompt=f"Какой сервис обычно связан с портом {number}/TCP?",
+                hint=f"💡 Назначение: {purpose}",
             )
             if selected is None:
                 return
@@ -2441,7 +2991,9 @@ def ports_quiz(stdscr):
                 stdscr,
                 f"🌐 ПОРТЫ • {service}",
                 choices,
-                "Какой порт обычно использует этот сервис?"
+                "↑/↓ выбор • Enter • Esc — выйти",
+                prompt=f"Какой порт обычно использует сервис {service}?",
+                hint=f"💡 Назначение: {purpose}",
             )
             if selected is None:
                 return
@@ -2594,6 +3146,14 @@ def free_investigation(stdscr):
         )
         if choice is None or choice == 6:
             break
+        if choice == 5:
+            if not actions:
+                show_text(stdscr, "📝 РАНО ДЕЛАТЬ ВЫВОД", [
+                    "Сначала собери хотя бы один факт:",
+                    "проверь процессы, сеть, логи или службы.",
+                ])
+                continue
+            break
 
         action_names = ["процессы", "сеть", "лог", "служб", "артефакт"]
         action = action_names[choice]
@@ -2694,8 +3254,12 @@ def local_practice(stdscr):
             print(f"Ошибка: {e}")
         print("─" * 58)
         print("\nНажми Enter, чтобы вернуться в меню...")
-        input()
+        try:
+            input()
+        except EOFError:
+            pass
         stdscr.clear()
+        stdscr.refresh()
         add_xp(5)
         save_progress()
 
@@ -2727,12 +3291,15 @@ def progress_menu(stdscr):
 
 
 def main_menu(stdscr):
-    curses.curs_set(0)
+    # Включаем обработку специальных клавиш терминала: стрелки, F1 и т.д.
+    stdscr.keypad(True)
+    set_cursor(False)
     items = [
         "📚 Обучение",
         "🌐 Сети",
         "🧠 Тест",
         "🌐 Знание портов",
+        "🧮 Тренажёр Subnetting",
         "🎯 Распознать атаку",
         "🛡️ Стажёр SOC",
         "🎯 Свободное расследование",
@@ -2741,82 +3308,45 @@ def main_menu(stdscr):
         "📊 Мой прогресс",
         "🚪 Выход"
     ]
+    handlers = [
+        lesson_menu, network_trainer_menu, quiz, ports_quiz, subnetting_quiz,
+        attack_quiz, incident_mode, free_investigation, knowledge_menu,
+        local_practice, progress_menu,
+    ]
 
+    selected = 0
     while True:
-        # Главное меню рисуем отдельно, чтобы показывать уровень и XP.
-        stdscr.clear()
+        stdscr.erase()
         h, w = stdscr.getmaxyx()
-        try:
-            stdscr.addstr(1, 2, "╔══════════════════════════════════════════════════════════╗")
-            stdscr.addstr(2, 2, "║              🛡️  CYBER TRAINER  🛡️                    ║")
-            stdscr.addstr(3, 2, "║          Linux • Networks • SOC • Security              ║")
-            stdscr.addstr(4, 2, "╚══════════════════════════════════════════════════════════╝")
-            stdscr.addstr(6, 2, f"⭐ Уровень {level()}   |   XP: {progress['xp']}", curses.A_BOLD)
-        except curses.error:
-            pass
+        safe_addstr(stdscr, 1, 2, "🛡️  CYBER TRAINER", curses.A_BOLD)
+        safe_addstr(stdscr, 2, 2, f"⭐ Уровень {level()}   |   XP: {progress['xp']}")
+        safe_addstr(stdscr, 3, 2, "═" * min(58, max(10, w - 4)))
 
-        # Повторяем arrow_menu, но ниже шапки.
-        selected = 0
-        while True:
-            stdscr.clear()
-            try:
-                stdscr.addstr(1, 2, "🛡️  CYBER TRAINER", curses.A_BOLD)
-                stdscr.addstr(2, 2, f"⭐ Уровень {level()}   |   XP: {progress['xp']}")
-                stdscr.addstr(3, 2, "═" * min(58, max(10, w - 4)))
-            except curses.error:
-                pass
+        for i, item in enumerate(items):
+            attr = curses.A_REVERSE | curses.A_BOLD if i == selected else curses.A_NORMAL
+            prefix = "➤ " if i == selected else "  "
+            safe_addstr(stdscr, 5 + i, 2, prefix + item, attr)
 
-            for i, item in enumerate(items):
-                y = 5 + i
-                attr = curses.A_REVERSE | curses.A_BOLD if i == selected else curses.A_NORMAL
-                prefix = "➤ " if i == selected else "  "
-                try:
-                    stdscr.addstr(y, 2, (prefix + item)[:max(1, w - 4)], attr)
-                except curses.error:
-                    pass
+        safe_addstr(stdscr, h - 2, 2, "↑/↓ выбор • Enter открыть • Esc выйти")
+        stdscr.refresh()
 
-            try:
-                stdscr.addstr(h - 2, 2, "↑/↓ выбор • Enter открыть • Esc выйти")
-            except curses.error:
-                pass
-
-            key = stdscr.getch()
-            if key in (curses.KEY_UP, ord('k')):
-                selected = (selected - 1) % len(items)
-            elif key in (curses.KEY_DOWN, ord('j')):
-                selected = (selected + 1) % len(items)
-            elif key in (curses.KEY_ENTER, 10, 13):
-                break
-            elif key == 27:
+        key = stdscr.getch()
+        if key in (curses.KEY_UP, ord("k")):
+            selected = (selected - 1) % len(items)
+        elif key in (curses.KEY_DOWN, ord("j")):
+            selected = (selected + 1) % len(items)
+        elif key in (curses.KEY_ENTER, 10, 13):
+            if selected == len(items) - 1:
                 return
-
-        if selected == 0:
-            lesson_menu(stdscr)
-        elif selected == 1:
-            network_trainer_menu(stdscr)
-        elif selected == 2:
-            quiz(stdscr)
-        elif selected == 3:
-            ports_quiz(stdscr)
-        elif selected == 4:
-            attack_quiz(stdscr)
-        elif selected == 5:
-            incident_mode(stdscr)
-        elif selected == 6:
-            free_investigation(stdscr)
-        elif selected == 7:
-            knowledge_menu(stdscr)
-        elif selected == 8:
-            local_practice(stdscr)
-        elif selected == 9:
-            progress_menu(stdscr)
-        elif selected == 10:
+            handlers[selected](stdscr)
+            set_cursor(False)
+        elif key == 27:
             return
 
 
 def main():
     try:
-        curses.wrapper(main_menu)
+        curses.wrapper(lambda scr: main_menu(KeyScreen(scr)))
     except KeyboardInterrupt:
         pass
     print("\nДо встречи, будущий специалист по кибербезопасности! 🛡️")
