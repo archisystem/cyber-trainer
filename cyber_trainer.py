@@ -6,6 +6,7 @@ import curses
 import os
 import random
 import subprocess
+import textwrap
 from pathlib import Path
 
 DATA_FILE = Path.home() / ".cyber_trainer_progress.json"
@@ -972,6 +973,1126 @@ def ports_lesson(stdscr):
     ])
 
 
+# ============================================================
+# 🌐 ПОЛНОЦЕННЫЙ ТРЕНАЖЕР ПО СЕТЯМ
+# Cisco + Linux networking / troubleshooting
+# ============================================================
+
+COMMANDS = [
+    ("ARP", "Как посмотреть ARP-таблицу Cisco?", "show ip arp"),
+    ("ARP", "Как посмотреть таблицу соседей Linux?", "ip neigh"),
+    ("Interfaces", "Как быстро посмотреть IP и состояние интерфейсов Cisco?", "show ip interface brief"),
+    ("Interfaces", "Как посмотреть IP-адреса интерфейсов Linux?", "ip addr"),
+    ("Routing", "Как посмотреть таблицу маршрутизации Cisco?", "show ip route"),
+    ("Routing", "Как посмотреть таблицу маршрутизации Linux?", "ip route"),
+    ("VLAN", "Как посмотреть VLAN и порты?", "show vlan brief"),
+    ("Trunk", "Как проверить trunk и разрешённые VLAN?", "show interfaces trunk"),
+    ("EtherChannel", "Как проверить состояние EtherChannel?", "show etherchannel summary"),
+    ("OSPF", "Как проверить OSPF-соседей?", "show ip ospf neighbor"),
+    ("OSPF", "Как проверить участие интерфейса в OSPF?", "show ip ospf interface"),
+    ("OSPF", "Как посмотреть общие параметры OSPF?", "show ip protocols"),
+    ("HSRP", "Как проверить Active/Standby и virtual IP?", "show standby"),
+    ("Connectivity", "Как проверить доступность IP?", "ping"),
+    ("Connectivity", "Как увидеть путь до узла?", "traceroute"),
+    ("Services", "Как посмотреть TCP/UDP sockets Linux?", "ss -tuln"),
+]
+
+SCENARIOS = [
+    {
+        "name": "Удалённая сеть недоступна",
+        "diagram": """
+        PC1
+         |
+        SW1
+         |
+        R1 -------- R2
+                    |
+                   SW2
+                    |
+                   PC2
+
+PC1  192.168.10.10/24
+GW   192.168.10.1
+
+R1 G0/0 192.168.10.1/24
+R1 G0/1 10.0.12.1/30
+
+R2 G0/0 10.0.12.2/30
+R2 G0/1 192.168.20.1/24
+
+PC2  192.168.20.10/24
+GW   192.168.20.1
+""",
+        "problem": "PC1 пингует свой шлюз, но PC2 недоступен.",
+        "steps": [
+            ("Ты на R1. Что проверишь первым?", "show ip route",
+             "Сначала проверяем, есть ли маршрут до сети PC2."),
+            ("Маршрута 192.168.20.0/24 нет. Что проверишь для OSPF?",
+             "show ip ospf neighbor",
+             "Проверяем соседство R1 и R2."),
+            ("Соседа нет. Что проверишь на интерфейсе?",
+             "show ip ospf interface",
+             "Проверяем участие интерфейса в OSPF."),
+            ("Что ещё посмотреть в настройках OSPF?",
+             "show ip protocols",
+             "Проверяем network statements и passive-interface."),
+        ],
+    },
+    {
+        "name": "Неправильный gateway",
+        "diagram": """
+        PC1
+         |
+        SW1
+         |
+        R1
+
+PC1: 192.168.10.50/24
+GW:  192.168.20.1
+
+R1: 192.168.10.1/24
+""",
+        "problem": "PC1 не может выйти за пределы своей сети.",
+        "steps": [
+            ("Что проверишь на PC1?", "ip route",
+             "Проверяем default route/gateway."),
+            ("Как проверить IP и маску интерфейса?", "ip addr",
+             "Проверяем адрес и маску."),
+        ],
+    },
+    {
+        "name": "ARP Incomplete",
+        "diagram": """
+        R1
+         |
+        SW1
+         |
+        PC2
+
+R1  192.168.20.1
+PC2 192.168.20.10
+""",
+        "problem": "На R1 запись ARP для PC2 имеет состояние Incomplete.",
+        "steps": [
+            ("Какую таблицу проверим?", "show ip arp",
+             "Проверяем IP → MAC и состояние ARP."),
+            ("ARP не получает MAC. Что проверишь на R1?",
+             "show ip interface brief",
+             "Проверяем состояние интерфейсов."),
+            ("Интерфейс up/up. Что проверить на SW?",
+             "show vlan brief",
+             "Проверяем VLAN и порт."),
+        ],
+    },
+    {
+        "name": "Неправильная маска",
+        "diagram": """
+        PC1 -------- SW1 -------- R1
+
+PC1: 192.168.10.10/25
+R1:  192.168.10.200/24
+""",
+        "problem": "PC1 не может нормально взаимодействовать со шлюзом.",
+        "steps": [
+            ("Что проверишь на PC1?", "ip addr",
+             "Проверяем IP и маску."),
+            ("Как проверить маршруты Linux?", "ip route",
+             "Проверяем, как ОС определяет локальную сеть."),
+        ],
+    },
+    {
+        "name": "Порт в неправильном VLAN",
+        "diagram": """
+        PC1
+         |
+       Fa0/5
+         |
+        SW1
+
+PC1 должен быть VLAN 10.
+Fa0/5 находится VLAN 20.
+""",
+        "problem": "PC1 физически подключён, но не работает в нужной сети.",
+        "steps": [
+            ("Что проверишь на SW1?", "show vlan brief",
+             "Проверяем VLAN и принадлежность порта."),
+        ],
+    },
+    {
+        "name": "VLAN не проходит через trunk",
+        "diagram": """
+        PC1                 PC2
+         |                   |
+      VLAN 10             VLAN 10
+         |                   |
+        SW1 ===== TRUNK ==== SW2
+
+Allowed VLAN: 1,20
+Нужен VLAN 10.
+""",
+        "problem": "PC1 и PC2 в VLAN 10, но не пингуются.",
+        "steps": [
+            ("Что проверишь?", "show interfaces trunk",
+             "Проверяем allowed VLAN и состояние trunk."),
+            ("Что ещё проверить на обоих SW?", "show vlan brief",
+             "VLAN 10 должен существовать на нужных коммутаторах."),
+        ],
+    },
+    {
+        "name": "Trunk стал access",
+        "diagram": """
+        SW1 ================= SW2
+              Fa0/1
+
+SW1 Fa0/1 = trunk
+SW2 Fa0/1 = access
+""",
+        "problem": "VLAN 10 перестал проходить между SW1 и SW2.",
+        "steps": [
+            ("Как проверить trunk?", "show interfaces trunk",
+             "Проверяем, является ли интерфейс trunk."),
+            ("Что ещё полезно проверить?", "show vlan brief",
+             "Если порт access, увидим его VLAN."),
+        ],
+    },
+    {
+        "name": "Native VLAN mismatch",
+        "diagram": """
+        SW1 ================= SW2
+              TRUNK
+
+SW1 native VLAN 10
+SW2 native VLAN 1
+""",
+        "problem": "На trunk появляется предупреждение о native VLAN mismatch.",
+        "steps": [
+            ("Какую команду проверишь?", "show interfaces trunk",
+             "Проверяем native VLAN с обеих сторон."),
+        ],
+    },
+    {
+        "name": "EtherChannel P/I",
+        "diagram": """
+        SW1 ================= SW2
+          Fa0/1 -------- Fa0/1
+          Fa0/2 -------- Fa0/2
+
+SW1: P / P
+SW2: P / I
+""",
+        "problem": "Один порт не вошёл в EtherChannel.",
+        "steps": [
+            ("Что проверишь?", "show etherchannel summary",
+             "Смотрим P/I и состояние Port-channel."),
+            ("Что проверить дальше?", "show interfaces trunk",
+             "Проверяем одинаковую trunk-конфигурацию."),
+        ],
+    },
+    {
+        "name": "LACP не создаётся",
+        "diagram": """
+        SW1 ================= SW2
+
+SW1: channel-group 1 mode passive
+SW2: channel-group 1 mode passive
+""",
+        "problem": "EtherChannel не формируется.",
+        "steps": [
+            ("Что проверишь?", "show etherchannel summary",
+             "Проверяем состояние группы."),
+        ],
+    },
+    {
+        "name": "EtherChannel есть, VLAN не работает",
+        "diagram": """
+             Port-channel 1
+        SW1 ================= SW2
+           Fa0/1 + Fa0/2
+
+Po1 = trunk
+VLAN 10 отсутствует в allowed VLAN
+""",
+        "problem": "EtherChannel работает, но VLAN 10 не проходит.",
+        "steps": [
+            ("Что проверишь?", "show interfaces trunk",
+             "Проверяем allowed VLAN на Port-channel."),
+            ("Что проверить для состояния группы?",
+             "show etherchannel summary",
+             "Убеждаемся, что физические порты объединены."),
+        ],
+    },
+    {
+        "name": "OSPF сосед не появляется",
+        "diagram": """
+        R1 ---------------- R2
+
+10.0.12.1/30       10.0.12.2/30
+
+Ping работает.
+OSPF neighbor пуст.
+""",
+        "problem": "R1 и R2 пингуются, но OSPF-соседства нет.",
+        "steps": [
+            ("Что проверишь первым?", "show ip ospf neighbor",
+             "Проверяем наличие соседства."),
+            ("Соседа нет. Что проверить на интерфейсе?",
+             "show ip ospf interface",
+             "Проверяем участие интерфейса в OSPF."),
+            ("Что ещё проверить в конфигурации OSPF?",
+             "show ip protocols",
+             "Проверяем network statements и passive-interface."),
+        ],
+    },
+    {
+        "name": "OSPF разные Area",
+        "diagram": """
+        R1 ---------------- R2
+
+R1: Area 0
+R2: Area 1
+""",
+        "problem": "OSPF-соседство не формируется.",
+        "steps": [
+            ("Что проверишь?", "show ip ospf interface",
+             "Проверяем Area интерфейса."),
+        ],
+    },
+    {
+        "name": "OSPF неправильный network",
+        "diagram": """
+        R1 ---------------- R2
+
+R1 G0/0: 10.0.12.1/30
+
+OSPF:
+network 10.0.13.0 0.0.0.3 area 0
+
+Ping работает.
+OSPF neighbor пуст.
+""",
+        "problem": "Интерфейс физически работает, но не участвует в OSPF.",
+        "steps": [
+            ("Что проверишь?", "show ip ospf interface",
+             "Проверяем, участвует ли G0/0 в OSPF."),
+            ("Что посмотреть в конфигурации OSPF?",
+             "show ip protocols",
+             "Увидим network statements."),
+        ],
+    },
+    {
+        "name": "OSPF passive-interface",
+        "diagram": """
+        R1 ---------------- R2
+
+G0/0 участвует в OSPF,
+но G0/0 настроен passive-interface.
+""",
+        "problem": "IP-связность работает, но OSPF-соседство не появляется.",
+        "steps": [
+            ("Что проверишь?", "show ip protocols",
+             "Проверяем passive-interface."),
+            ("Что ещё можно проверить?",
+             "show ip ospf interface",
+             "Проверяем OSPF-состояние интерфейса."),
+        ],
+    },
+    {
+        "name": "OSPF Hello/Dead timers",
+        "diagram": """
+        R1 ---------------- R2
+
+R1: Hello 10 / Dead 40
+R2: Hello 30 / Dead 120
+""",
+        "problem": "Соседство OSPF не устанавливается.",
+        "steps": [
+            ("Что проверишь на интерфейсе?", "show ip ospf interface",
+             "Проверяем Hello/Dead timers."),
+        ],
+    },
+    {
+        "name": "OSPF сосед есть, маршрута нет",
+        "diagram": """
+        R1 -------- R2 -------- R3
+
+R1 FULL R2
+R2 FULL R3
+
+Но R1 не видит Loopback R3.
+""",
+        "problem": "OSPF соседство FULL, но маршрут к сети R3 отсутствует.",
+        "steps": [
+            ("Что проверишь на R1?", "show ip route",
+             "Проверяем наличие OSPF-маршрута."),
+            ("Что проверить на R2?", "show ip ospf interface",
+             "Проверяем участие нужного интерфейса/Loopback в OSPF."),
+        ],
+    },
+    {
+        "name": "HSRP Active/Standby",
+        "diagram": """
+              R1
+          ACTIVE
+         priority 110
+             |
+             +---- VLAN 10 ---- PC1
+             |
+         Virtual IP
+        192.168.10.1
+             |
+              R2
+           STANDBY
+         priority 100
+""",
+        "problem": "Нужно определить, какой роутер сейчас Active.",
+        "steps": [
+            ("Какую команду введёшь?", "show standby",
+             "Показывает Active, Standby, priority и virtual IP."),
+        ],
+    },
+    {
+        "name": "HSRP неправильный Active",
+        "diagram": """
+        R1 priority 100
+        R2 priority 110
+
+        Virtual IP:
+        192.168.10.1
+""",
+        "problem": "Active стал R2, хотя по задумке должен быть R1.",
+        "steps": [
+            ("Что проверишь?", "show standby",
+             "Проверяем priority и Active/Standby."),
+        ],
+    },
+    {
+        "name": "Интерфейс down",
+        "diagram": """
+        PC1 ---- SW1 ---- R1
+
+R1 G0/0:
+administratively down
+""",
+        "problem": "PC1 потерял связь с gateway.",
+        "steps": [
+            ("Что проверишь первым на R1?",
+             "show ip interface brief",
+             "Проверяем состояние интерфейса."),
+        ],
+    },
+    {
+        "name": "Нет default route",
+        "diagram": """
+        LAN
+         |
+        R1
+         |
+        ISP
+         |
+      Internet
+
+R1 не имеет 0.0.0.0/0
+""",
+        "problem": "Локальная сеть работает, интернет недоступен.",
+        "steps": [
+            ("Что проверишь?", "show ip route",
+             "Ищем default route."),
+        ],
+    },
+    {
+        "name": "Дублирование IP",
+        "diagram": """
+        PC1 -------- SW1 -------- PC2
+
+PC1: 192.168.10.10
+PC2: 192.168.10.10
+""",
+        "problem": "Связь нестабильна, ARP постоянно меняется.",
+        "steps": [
+            ("Что проверишь на Cisco?", "show ip arp",
+             "Смотрим соответствие IP и MAC."),
+        ],
+    },
+    {
+        "name": "Linux neighbor",
+        "diagram": """
+        Ubuntu
+           |
+          SW1
+           |
+          R1
+
+Ubuntu: 192.168.10.10
+R1:     192.168.10.1
+""",
+        "problem": "Ubuntu не может определить MAC шлюза.",
+        "steps": [
+            ("Как посмотреть таблицу соседей Linux?", "ip neigh",
+             "Показывает IP ↔ MAC и состояние neighbor."),
+        ],
+    },
+    {
+        "name": "Linux routing",
+        "diagram": """
+        Ubuntu
+           |
+          R1
+           |
+        Internet
+""",
+        "problem": "Ubuntu не выходит в другую сеть.",
+        "steps": [
+            ("Что проверишь первым?", "ip route",
+             "Проверяем default gateway и маршруты."),
+        ],
+    },
+    {
+        "name": "Поиск места обрыва",
+        "diagram": """
+        PC1
+         |
+        R1
+         |
+        R2
+         |
+        R3
+         |
+        PC2
+""",
+        "problem": "PC1 не знает, на каком маршрутизаторе теряется путь к PC2.",
+        "steps": [
+            ("Как увидеть путь до назначения?", "traceroute",
+             "Показывает промежуточные hop."),
+        ],
+    },
+    {
+        "name": "Большая авария",
+        "diagram": """
+                         +------ R2 ------+
+                         |                |
+                         |     OSPF       |
+                         |                |
+PC1 -- SW1 == EtherChannel == SW2 -- R3
+       |                    |
+     VLAN 10              VLAN 20
+       |                    |
+      R1 -------------------+
+             HSRP
+
+PC1: 192.168.10.10
+PC2: 192.168.20.10
+""",
+        "problem": "PC1 не может достучаться до PC2. Самостоятельно определи место неисправности.",
+        "steps": [
+            ("С чего начнёшь на маршрутизаторе?",
+             "show ip interface brief",
+             "Сначала проверяем состояние интерфейсов."),
+            ("Интерфейсы up/up. Что проверишь?",
+             "show ip route",
+             "Проверяем наличие маршрута."),
+            ("Маршрута нет и используется OSPF. Что проверить?",
+             "show ip ospf neighbor",
+             "Проверяем соседство."),
+            ("На пути есть EtherChannel. Как проверить его?",
+             "show etherchannel summary",
+             "Проверяем Port-channel и физические порты."),
+            ("Подозрение на VLAN/Trunk. Что проверить?",
+             "show interfaces trunk",
+             "Проверяем trunk и allowed VLAN."),
+        ],
+    },
+]
+
+# ============================================================
+# НОРМАЛИЗАЦИЯ
+# ============================================================
+
+def norm(value):
+    return " ".join(value.lower().strip().split())
+
+
+def command_matches(user, answer):
+    user = norm(user)
+    answer = norm(answer)
+
+    if user == answer:
+        return True
+
+    if answer in ("ping", "traceroute"):
+        return user.startswith(answer + " ") or user == answer
+
+    return False
+
+
+# ============================================================
+# DRAW
+# ============================================================
+
+def draw_box(stdscr, title, lines, selected=0, footer=None):
+    stdscr.clear()
+    h, w = stdscr.getmaxyx()
+
+    border = "═"
+    width = min(w - 4, 78)
+    left = max(1, (w - width) // 2)
+
+    stdscr.addstr(1, left, "╔" + border * (width - 2) + "╗")
+    title_text = f"  {title}  "
+    stdscr.addstr(2, left, "║" + title_text.center(width - 2) + "║")
+    stdscr.addstr(3, left, "╠" + border * (width - 2) + "╣")
+
+    y = 4
+
+    for i, line in enumerate(lines):
+        if y >= h - 3:
+            break
+
+        wrapped = textwrap.wrap(str(line), width=max(10, width - 8)) or [""]
+        for part in wrapped:
+            if y >= h - 3:
+                break
+            stdscr.addstr(y, left + 3, part[:width - 6])
+            y += 1
+
+    if footer:
+        footer_y = h - 2
+        stdscr.addstr(footer_y, left + 2, footer[:width - 4])
+
+    stdscr.addstr(min(h - 1, y), left, "╚" + border * (width - 2) + "╝")
+    stdscr.refresh()
+
+
+def menu(stdscr, title, items, subtitle="↑↓ выбор   Enter — выбрать   Q — назад"):
+    """Полноценное меню со скроллингом для длинных списков."""
+    if not items:
+        return None
+
+    selected = 0
+    offset = 0
+
+    while True:
+        h, _ = stdscr.getmaxyx()
+        visible = max(3, h - 7)
+
+        if selected < offset:
+            offset = selected
+        elif selected >= offset + visible:
+            offset = selected - visible + 1
+
+        lines = []
+        end = min(len(items), offset + visible)
+        for i in range(offset, end):
+            prefix = "➜ " if i == selected else "  "
+            lines.append(prefix + items[i])
+
+        if offset > 0:
+            lines.insert(0, "↑ ещё выше")
+        if end < len(items):
+            lines.append("↓ ещё ниже")
+
+        draw_box(stdscr, title, lines, selected - offset, subtitle)
+
+        key = stdscr.getch()
+
+        if key in (curses.KEY_UP, ord("k")):
+            selected = (selected - 1) % len(items)
+
+        elif key in (curses.KEY_DOWN, ord("j")):
+            selected = (selected + 1) % len(items)
+
+        elif key in (10, 13, curses.KEY_ENTER):
+            return selected
+
+        elif key in (ord("q"), ord("Q"), 27):
+            return None
+
+
+# ============================================================
+# INPUT
+# ============================================================
+
+def input_screen(stdscr, title, lines, prompt="> "):
+    stdscr.clear()
+    h, w = stdscr.getmaxyx()
+
+    y = 1
+
+    stdscr.addstr(y, 2, "═" * min(w - 4, 78))
+    y += 1
+
+    stdscr.addstr(y, 2, title[:w - 4], curses.A_BOLD)
+    y += 2
+
+    for line in lines:
+        for part in textwrap.wrap(str(line), width=max(20, w - 6)) or [""]:
+            if y >= h - 4:
+                break
+            stdscr.addstr(y, 3, part)
+            y += 1
+
+    y += 1
+    stdscr.addstr(y, 3, prompt)
+    curses.echo()
+    curses.curs_set(1)
+
+    answer = stdscr.getstr(y, 3 + len(prompt), max(1, w - 8)).decode(
+        "utf-8", errors="ignore"
+    )
+
+    curses.noecho()
+    curses.curs_set(0)
+
+    return answer
+
+
+def message(stdscr, title, lines):
+    draw_box(stdscr, title, lines, footer="Enter — продолжить")
+    stdscr.getch()
+
+
+# ============================================================
+# COMMAND MODE
+# ============================================================
+
+def command_mode(stdscr, stats):
+    item = random.choice(COMMANDS)
+
+    category, question, answer = item
+
+    user = input_screen(
+        stdscr,
+        f"🧠 КОМАНДА / {category}",
+        [
+            question,
+            "",
+            "Не подглядывай. Введи команду полностью.",
+        ],
+    )
+
+    if command_matches(user, answer):
+        stats["correct"] += 1
+        stats["streak"] += 1
+
+        message(
+            stdscr,
+            "✅ ПРАВИЛЬНО",
+            [
+                f"Команда: {answer}",
+                "",
+                f"Серия: {stats['streak']}",
+                f"Очки: {stats['correct']}",
+            ],
+        )
+    else:
+        stats["wrong"] += 1
+        stats["streak"] = 0
+        stats["mistakes"].append(answer)
+
+        message(
+            stdscr,
+            "❌ ОШИБКА",
+            [
+                f"Ты ввёл: {user or '(пусто)'}",
+                f"Правильная команда: {answer}",
+                "",
+                "Эта команда будет встречаться чаще.",
+            ],
+        )
+
+
+# ============================================================
+# SCENARIO MODE
+# ============================================================
+
+def scenario_mode_selected(stdscr, stats, scenario):
+    """Прохождение схемы с 3 жизнями. Ошибка снимает жизнь, но не раскрывает ответ."""
+    while True:
+        lives = 3
+        wrong_in_run = 0
+
+        draw_box(
+            stdscr,
+            f"🌐 СХЕМА: {scenario['name']}",
+            [
+                scenario["diagram"],
+                "",
+                "🚨 СИТУАЦИЯ:",
+                scenario["problem"],
+                "",
+                "❤️❤️❤️  Жизни: 3",
+                "",
+                "Enter — начать диагностику",
+                "Q — назад к списку",
+            ],
+        )
+
+        key = stdscr.getch()
+        if key in (ord("q"), ord("Q"), 27):
+            return
+
+        for number, (question, answer, explanation) in enumerate(scenario["steps"], 1):
+            while True:
+                hearts = "❤️" * lives + "🖤" * (3 - lives)
+                user = input_screen(
+                    stdscr,
+                    f"🔎 ДИАГНОСТИКА — ШАГ {number}",
+                    [
+                        f"Схема: {scenario['name']}",
+                        "",
+                        f"Жизни: {hearts}   Ошибок: {wrong_in_run}",
+                        "",
+                        f"Ситуация: {scenario['problem']}",
+                        "",
+                        question,
+                        "",
+                        "Введи команду:",
+                    ],
+                )
+
+                if command_matches(user, answer):
+                    stats["correct"] += 1
+                    stats["streak"] += 1
+                    draw_box(
+                        stdscr,
+                        f"✅ ПРАВИЛЬНО — ШАГ {number}",
+                        [
+                            f"Команда: {answer}",
+                            "",
+                            f"❤️ Жизни: {lives}/3",
+                            "",
+                            "➡️ Переходим к следующему шагу.",
+                        ],
+                        footer="Enter — следующий шаг",
+                    )
+                    stdscr.getch()
+                    break
+
+                # Неверный ответ: жизнь снимается, но правильный ответ/объяснение
+                # автоматически НЕ показываются.
+                stats["wrong"] += 1
+                stats["streak"] = 0
+                stats["mistakes"].append(answer)
+                wrong_in_run += 1
+                lives -= 1
+
+                if lives <= 0:
+                    while True:
+                        draw_box(
+                            stdscr,
+                            "💀 ВЫ ПРОИГРАЛИ",
+                            [
+                                "У тебя закончились все 3 жизни.",
+                                "",
+                                f"Схема: {scenario['name']}",
+                                f"Ошибок в этом прохождении: {wrong_in_run}",
+                                "",
+                                "🔄 1 — начать эту схему заново",
+                                "🏠 2 — выйти в главное меню сетевого тренажёра",
+                                "",
+                                "Выбери действие:",
+                            ],
+                        )
+                        key = stdscr.getch()
+                        if key == ord("1"):
+                            break
+                        if key == ord("2") or key in (ord("q"), ord("Q"), 27):
+                            return
+                    # Перезапускаем всю схему с 3 жизнями.
+                    break
+
+                draw_box(
+                    stdscr,
+                    "❌ НЕПРАВИЛЬНО",
+                    [
+                        "Ответ неверный.",
+                        "",
+                        f"❤️ Осталось жизней: {lives}/3",
+                        "",
+                        "Правильный ответ НЕ показывается.",
+                        "Продумай следующий шаг самостоятельно.",
+                    ],
+                    footer="Enter — продолжить",
+                )
+                stdscr.getch()
+
+        else:
+            # Все шаги пройдены — схема завершена.
+            draw_box(
+                stdscr,
+                "🏁 СХЕМА ЗАВЕРШЕНА",
+                [
+                    f"{scenario['name']}",
+                    "",
+                    f"❤️ Осталось жизней: {lives}/3",
+                    f"Ошибок в прохождении: {wrong_in_run}",
+                    "",
+                    "Отлично! Ты полностью прошёл диагностику.",
+                ],
+                footer="Enter — вернуться",
+            )
+            stdscr.getch()
+            return
+
+        # Если дошли сюда из-за проигрыша и выбрали «1», начинаем заново.
+        continue
+
+
+def scenario_mode(stdscr, stats):
+    """Запускает одну случайную схему и возвращает в меню после её завершения."""
+    scenario = random.choice(SCENARIOS)
+    scenario_mode_selected(stdscr, stats, scenario)
+
+
+# ============================================================
+# MIXED MODE
+# ============================================================
+
+def mixed_mode(stdscr, stats):
+    modes = ["command", "scenario"]
+    selected = random.choice(modes)
+
+    if selected == "command":
+        command_mode(stdscr, stats)
+    else:
+        scenario_mode(stdscr, stats)
+
+
+# ============================================================
+# MISTAKES
+# ============================================================
+
+def mistakes_mode(stdscr, stats):
+    if not stats["mistakes"]:
+        message(
+            stdscr,
+            "🔥 ОШИБКИ",
+            [
+                "Пока ошибок нет.",
+                "",
+                "Продолжай тренировку.",
+            ],
+        )
+        return
+
+    answer = random.choice(stats["mistakes"])
+
+    questions = [
+        q for _, q, a in COMMANDS if a == answer
+    ]
+
+    if not questions:
+        questions = [f"Вспомни команду: {answer}"]
+
+    user = input_screen(
+        stdscr,
+        "🔥 ПОВТОР ОШИБОК",
+        [
+            questions[0],
+            "",
+            "Эта команда была ошибочной ранее.",
+        ],
+    )
+
+    if command_matches(user, answer):
+        stats["correct"] += 1
+        stats["streak"] += 1
+
+        message(
+            stdscr,
+            "✅ НА ЭТОТ РАЗ ПРАВИЛЬНО",
+            [
+                f"Команда: {answer}",
+                "Ошибка закреплена.",
+            ],
+        )
+    else:
+        stats["wrong"] += 1
+        stats["streak"] = 0
+
+        message(
+            stdscr,
+            "❌ ЕЩЁ РАЗ",
+            [
+                f"Правильная команда: {answer}",
+                "Она останется в повторении.",
+            ],
+        )
+
+
+# ============================================================
+# COMMAND LIST
+# ============================================================
+
+def command_list(stdscr):
+    lines = []
+
+    for category, question, answer in COMMANDS:
+        lines.append(f"{category:<15} {answer}")
+
+    draw_box(
+        stdscr,
+        "📚 КОМАНДЫ",
+        lines,
+        footer="Enter — назад",
+    )
+
+    stdscr.getch()
+
+
+# ============================================================
+# SCENARIO LIST
+# ============================================================
+
+def scenario_list(stdscr, stats):
+    """Интерактивный список всех схем и ситуаций.
+
+    Стрелки выбирают конкретную ситуацию, Enter запускает её.
+    Q возвращает в меню сетевого тренажёра.
+    """
+    page_size = 10
+    page = 0
+
+    while True:
+        total_pages = (len(SCENARIOS) + page_size - 1) // page_size
+        start = page * page_size
+        end = min(start + page_size, len(SCENARIOS))
+
+        items = [
+            f"{i + 1:02d}. {SCENARIOS[i]['name']}"
+            for i in range(start, end)
+        ]
+
+        items += ["← Предыдущая страница", "→ Следующая страница", "↩ Назад"]
+
+        selected = menu(
+            stdscr,
+            f"🗺 СХЕМЫ И СИТУАЦИИ  {page + 1}/{total_pages}",
+            items,
+            "↑↓ выбор   Enter — открыть   Q — назад",
+        )
+
+        if selected is None or selected == len(items) - 1:
+            return
+
+        if selected == len(items) - 3:
+            if page > 0:
+                page -= 1
+            continue
+
+        if selected == len(items) - 2:
+            if page < total_pages - 1:
+                page += 1
+            continue
+
+        scenario = SCENARIOS[start + selected]
+        scenario_mode_selected(stdscr, stats, scenario)
+
+
+# ============================================================
+# STATISTICS
+# ============================================================
+
+def network_statistics(stdscr, stats):
+    total = stats["correct"] + stats["wrong"]
+
+    if total:
+        percent = round(stats["correct"] / total * 100)
+    else:
+        percent = 0
+
+    lines = [
+        f"Правильных ответов: {stats['correct']}",
+        f"Ошибок:             {stats['wrong']}",
+        f"Точность:            {percent}%",
+        f"Текущая серия:       {stats['streak']}",
+        "",
+        f"Команд в базе:       {len(COMMANDS)}",
+        f"Сценариев в базе:    {len(SCENARIOS)}",
+    ]
+
+    if stats["mistakes"]:
+        lines += [
+            "",
+            "Команды для повторения:",
+        ]
+
+        unique = list(dict.fromkeys(stats["mistakes"]))
+
+        for item in unique[-10:]:
+            lines.append(f"• {item}")
+
+    draw_box(
+        stdscr,
+        "📊 СТАТИСТИКА",
+        lines,
+        footer="Enter — назад",
+    )
+
+    stdscr.getch()
+
+
+# ============================================================
+# MAIN MENU
+# ============================================================
+
+def network_trainer_menu(stdscr):
+    curses.curs_set(0)
+
+    stats = {
+        "correct": 0,
+        "wrong": 0,
+        "streak": 0,
+        "mistakes": [],
+    }
+
+    menu_items = [
+        "🧠 Вспомнить команду",
+        "🌐 Схема + диагностика",
+        "⚡ Смешанный режим",
+        "🔥 Повторить ошибки",
+        "📚 Команды",
+        "🗺 Схемы и ситуации",
+        "📊 Статистика",
+        "🚪 Выход",
+    ]
+
+    while True:
+        total = stats["correct"] + stats["wrong"]
+
+        selected = menu(
+            stdscr,
+            "🌐 NETWORK SECURITY TRAINER",
+            menu_items,
+            f"Очки: {stats['correct']}   Серия: {stats['streak']}   "
+            f"Вопросов: {total}   ↑↓ Enter Q",
+        )
+
+        if selected is None or selected == 7:
+            break
+
+        if selected == 0:
+            command_mode(stdscr, stats)
+
+        elif selected == 1:
+            scenario_mode(stdscr, stats)
+
+        elif selected == 2:
+            mixed_mode(stdscr, stats)
+
+        elif selected == 3:
+            mistakes_mode(stdscr, stats)
+
+        elif selected == 4:
+            command_list(stdscr)
+
+        elif selected == 5:
+            scenario_list(stdscr, stats)
+
+        elif selected == 6:
+            network_statistics(stdscr, stats)
+
+
+
 def lesson_menu(stdscr):
     labels = [
         "🐧 Linux",
@@ -996,6 +2117,11 @@ def lesson_menu(stdscr):
             continue
         if choice == 3:
             attacks_lesson(stdscr)
+            continue
+
+        # «Сети» внутри обучения открывает полноценный сетевой тренажёр.
+        if choice == 1:
+            network_trainer_menu(stdscr)
             continue
 
         # После добавления новых уроков индексы остальных тем сдвинулись.
@@ -1604,6 +2730,7 @@ def main_menu(stdscr):
     curses.curs_set(0)
     items = [
         "📚 Обучение",
+        "🌐 Сети",
         "🧠 Тест",
         "🌐 Знание портов",
         "🎯 Распознать атаку",
@@ -1666,22 +2793,24 @@ def main_menu(stdscr):
         if selected == 0:
             lesson_menu(stdscr)
         elif selected == 1:
-            quiz(stdscr)
+            network_trainer_menu(stdscr)
         elif selected == 2:
-            ports_quiz(stdscr)
+            quiz(stdscr)
         elif selected == 3:
-            attack_quiz(stdscr)
+            ports_quiz(stdscr)
         elif selected == 4:
-            incident_mode(stdscr)
+            attack_quiz(stdscr)
         elif selected == 5:
-            free_investigation(stdscr)
+            incident_mode(stdscr)
         elif selected == 6:
-            knowledge_menu(stdscr)
+            free_investigation(stdscr)
         elif selected == 7:
-            local_practice(stdscr)
+            knowledge_menu(stdscr)
         elif selected == 8:
-            progress_menu(stdscr)
+            local_practice(stdscr)
         elif selected == 9:
+            progress_menu(stdscr)
+        elif selected == 10:
             return
 
 
